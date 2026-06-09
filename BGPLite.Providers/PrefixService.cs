@@ -41,9 +41,16 @@ public sealed class PrefixService : IPrefixService
         var result = new List<(uint Prefix, byte Length, uint Asn)>();
         foreach (var asn in asns)
         {
-            var prefixes = await GetPrefixesAsync(asn);
-            foreach (var (prefix, length) in prefixes)
-                result.Add((prefix, length, asn));
+            try
+            {
+                var prefixes = await GetPrefixesAsync(asn);
+                foreach (var (prefix, length) in prefixes)
+                    result.Add((prefix, length, asn));
+            }
+            catch
+            {
+                // skip failed ASN, continue with others
+            }
         }
         return result;
     }

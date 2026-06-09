@@ -1,8 +1,10 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using BGPLite.Api.Entities;
 using BGPLite.Configuration;
+using BGPLite.Protocol;
 using BGPLite.Routing;
 using BGPLite.Server;
 using Microsoft.Extensions.Hosting;
@@ -17,6 +19,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
     private readonly AppConfig _config;
     private readonly BgpMetrics _metrics;
     private readonly IPrefixService? _prefixService;
+    private readonly ISessionManager? _sessionManager;
     private readonly ILogger<ManagementApi> _logger;
     private readonly int _port;
     private HttpListener? _listener;
@@ -29,13 +32,15 @@ public sealed class ManagementApi : IHostedService, IDisposable
         AppConfig config,
         BgpMetrics metrics,
         ILogger<ManagementApi> logger,
-        IPrefixService? prefixService = null)
+        IPrefixService? prefixService = null,
+        ISessionManager? sessionManager = null)
     {
         _store = store;
         _routeTable = routeTable;
         _config = config;
         _metrics = metrics;
         _prefixService = prefixService;
+        _sessionManager = sessionManager;
         _logger = logger;
         _port = config.ApiPort;
     }
@@ -79,6 +84,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
         }
     }
 
+    #region Router
+
     private async Task HandleAsync(HttpListenerContext ctx)
     {
         AddCorsHeaders(ctx);
@@ -92,39 +99,11 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
         var path = ctx.Request.Url!.AbsolutePath;
         var method = ctx.Request.HttpMethod;
+        var segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
 
         try
         {
-            ApiResponse response;
-
-            if (method == "GET" && path == "/api/my-ip")
-            {
-                var clientIp = ctx.Request.RemoteEndPoint?.Address.ToString() ?? "unknown";
-                response = ApiResponse.Ok(new { ip = clientIp });
-            }
-            else if (method == "GET" && path == "/api/asn-lists")
-                response = await HandleGetAsnListsAsync();
-            else if (method == "GET" && path == "/api/sessions")
-                response = HandleGetSessions();
-            else if (method == "POST" && path == "/api/peers")
-                response = await HandleCreatePeer(ctx);
-            else if (method == "GET" && path == "/api/peers")
-                response = HandleGetPeers();
-            else if (method == "GET" && path == "/api/routes/count")
-                response = HandleGetRouteCount();
-            else if (method == "GET" && path.StartsWith("/api/as/") && path.EndsWith("/prefixes/count"))
-                response = await HandleGetAsPrefixCountAsync(path);
-            else if (method == "GET" && path.StartsWith("/api/peer/") && path.EndsWith("/communities"))
-                response = HandleGetPeerCommunities(ExtractPeerIp(path));
-            else if (method == "PUT" && path.StartsWith("/api/peer/") && path.EndsWith("/communities"))
-                response = await HandleSetPeerCommunities(ExtractPeerIp(path), ctx);
-            else if (method == "DELETE" && path.StartsWith("/api/peer/") && path.EndsWith("/communities"))
-                response = HandleDeletePeerCommunities(ExtractPeerIp(path));
-            else if (method == "PUT" && path.StartsWith("/api/peer/") && path.EndsWith("/description"))
-                response = await HandleSetPeerDescription(ExtractPeerIp(path), ctx);
-            else
-                response = ApiResponse.Error("Not found", 404);
-
+            var response = Route(method, segments, ctx);
             await WriteResponse(ctx, response);
         }
         catch (Exception ex)
@@ -134,168 +113,165 @@ public sealed class ManagementApi : IHostedService, IDisposable
         }
     }
 
-    private async Task<ApiResponse> HandleGetAsnListsAsync()
+    private ApiResponse Route(string method, string[] segments, HttpListenerContext ctx)
     {
-        var lists = _config.RipeStat?.AsnLists ?? [];
-        var result = new List<object>();
+        // /api/server
+        if (IsGet(method, segments, "api", "server"))
+            return HandleGetServer();
 
-        foreach (var l in lists)
+        // /api/me
+        if (IsGet(method, segments, "api", "me"))
+            return HandleGetMe(ctx);
+
+        // /api/peers
+        if (IsPost(method, segments, "api", "peers"))
+            return HandleCreatePeer(ctx).GetAwaiter().GetResult();
+
+        // /api/peers/{id}
+        if (segments.Length == 3 && segments[0] == "api" && segments[1] == "peers" && method == "GET")
+            return HandleGetPeer(segments[2]);
+        if (segments.Length == 3 && segments[0] == "api" && segments[1] == "peers" && method == "PUT")
+            return HandleUpdatePeer(segments[2], ctx).GetAwaiter().GetResult();
+        if (segments.Length == 3 && segments[0] == "api" && segments[1] == "peers" && method == "DELETE")
+            return HandleDeletePeer(segments[2]);
+
+        // /api/peers/{id}/prefixes
+        if (segments.Length == 4 && segments[0] == "api" && segments[1] == "peers" && segments[3] == "prefixes" && method == "GET")
+            return HandleExportPrefixes(segments[2], ctx);
+
+        // /api/asn-lists
+        if (IsGet(method, segments, "api", "asn-lists"))
+            return HandleGetAsnListsAsync().GetAwaiter().GetResult();
+
+        // /api/sessions
+        if (IsGet(method, segments, "api", "sessions"))
+            return HandleGetSessions();
+
+        // /api/routes
+        if (IsGet(method, segments, "api", "routes"))
+            return HandleGetRoutes();
+
+        // /api/asns/{asn}/prefixes
+        if (segments.Length == 4 && segments[0] == "api" && segments[1] == "asns" && segments[3] == "prefixes" && method == "GET")
+            return HandleGetAsnPrefixes(segments[2], ctx);
+
+        return ApiResponse.Error("Not found", 404);
+    }
+
+    private static bool IsGet(string method, string[] segments, string s0, string s1)
+        => method == "GET" && segments.Length == 2 && segments[0] == s0 && segments[1] == s1;
+
+    private static bool IsPost(string method, string[] segments, string s0, string s1)
+        => method == "POST" && segments.Length == 2 && segments[0] == s0 && segments[1] == s1;
+
+    #endregion
+
+    #region GET /api/server
+
+    private ApiResponse HandleGetServer()
+    {
+        var bgp = _config.Bgp;
+        var ip = bgp.RouterId;
+        return ApiResponse.Ok(new
         {
-            int prefixCount = 0;
-            if (_prefixService is not null)
+            asn = bgp.Asn,
+            routerId = ip,
+            bgpPort = 179,
+            apiPort = _port,
+            holdTime = bgp.HoldTime,
+            keepalive = bgp.KeepAlive,
+            setup = new[]
             {
-                foreach (var asn in l.Asns)
-                {
-                    try { prefixCount += await _prefixService.GetPrefixCountAsync(asn); }
-                    catch { }
-                }
+                $"router bgp {bgp.Asn}",
+                $" neighbor <YOUR_IP> remote-as {bgp.Asn}",
+                $" neighbor <YOUR_IP> ebgp-multihop 2",
+                $" neighbor <YOUR_IP> update-source <YOUR_INTERFACE>",
+                $" neighbor <YOUR_IP> soft-reconfiguration inbound",
+                $"!",
+                $"address-family ipv4 unicast",
+                $" neighbor <YOUR_IP> activate",
+                $" neighbor <YOUR_IP> route-map BGPLite-IN in",
+                $" neighbor <YOUR_IP> route-map BGPLite-OUT out",
+                $"exit-address-family"
+            },
+            bird = new[]
+            {
+                $"protocol bgp bgplite {{",
+                $"  local as {bgp.Asn};",
+                $"  neighbor {ip} port 179;",
+                $"  multihop 2;",
+                $"  ipv4 {{",
+                $"    import all;",
+                $"    export none;",
+                $"  }};",
+                $"}}"
+            },
+            mikrotik = new[]
+            {
+                $"/routing bgp connection",
+                $"add name=bgplite remote.address={ip}/32 remote.as={bgp.Asn}",
+                $"  local.role=ebgp local.as={bgp.Asn}",
+                $"  hold-time={bgp.HoldTime}s keepalive-time={bgp.KeepAlive}s",
+                $"  as4-capability=yes add-path-out=none",
+                $"  multihop=yes",
+                $"  in.filter=bgplite-in out.filter=bgplite-out",
+                $"!",
+                $"/routing filter rule",
+                $"add chain=bgplite-in action=accept set-in-nexthop-direct=yes",
+                $"add chain=bgplite-out action=discard"
             }
+        });
+    }
 
-            result.Add(new
+    #endregion
+
+    #region GET /api/me
+
+    private ApiResponse HandleGetMe(HttpListenerContext ctx)
+    {
+        var clientIp = ctx.Request.RemoteEndPoint?.Address.ToString() ?? "unknown";
+
+        var peerInfo = _store.GetPeerByIp(clientIp);
+        if (peerInfo is null)
+            return ApiResponse.Ok(new { ip = clientIp, peer = (object?)null });
+
+        var peer = _store.GetDbPeerById(peerInfo.Id);
+        if (peer is null)
+            return ApiResponse.Ok(new { ip = clientIp, peer = (object?)null });
+
+        var subscriptions = _store.GetSubscriptions(peer.Id);
+        var customPrefixes = _store.GetCustomPrefixes(peer.Id);
+        var communities = _store.GetCommunitiesByIp(clientIp);
+
+        return ApiResponse.Ok(new
+        {
+            ip = clientIp,
+            peer = new
             {
-                id = l.Id,
-                l.Name,
-                l.Description,
-                l.Country,
-                prefixCount,
-                type = l.Country is not null ? "country" : "asn"
-            });
-        }
-
-        return ApiResponse.Ok(result);
-    }
-
-    private ApiResponse HandleGetSessions()
-    {
-        return ApiResponse.Ok(new
-        {
-            active = _metrics.ActiveSessions
+                id = peer.Id,
+                ip = peer.Ip,
+                asn = peer.Asn,
+                description = peer.Description,
+                status = peer.Status,
+                createdAt = peer.CreatedAt,
+                lastSessionAt = peer.LastSessionAt,
+                lists = subscriptions,
+                customPrefixes,
+                communities = communities.Select(CommunityToString),
+                allRoutes = communities.Count == 0
+            }
         });
     }
 
-    private async Task<ApiResponse> HandleGetAsPrefixCountAsync(string path)
-    {
-        if (_prefixService is null)
-            return ApiResponse.Error("Prefix service not available", 503);
+    #endregion
 
-        // /api/as/{asn}/prefixes/count → segments: ["", "api", "as", "{asn}", "prefixes", "count"]
-        var segments = path.Split('/');
-        if (segments.Length < 4 || !uint.TryParse(segments[3], out var asn))
-            return ApiResponse.Error("Invalid ASN", 400);
-
-        var count = await _prefixService.GetPrefixCountAsync(asn);
-        return ApiResponse.Ok(new { asn, prefixCount = count });
-    }
-
-    private static string ExtractPeerIp(string path)
-    {
-        // /api/peer/{ip}/communities → segments: ["", "api", "peer", "{ip}", ...]
-        return path.Split('/')[3];
-    }
-
-    private ApiResponse HandleGetPeers()
-    {
-        var peers = _store.GetAllPeers();
-        return ApiResponse.Ok(peers.Select(p => new
-        {
-            id = p.Id,
-            ip = p.Ip,
-            asn = p.Asn,
-            description = p.Description,
-            status = p.Status,
-            createdAt = p.CreatedAt,
-            lastSessionAt = p.LastSessionAt,
-            communities = p.Communities.Select(c => CommunityToString((uint)c.Community)),
-            allRoutes = p.Communities.Count == 0
-        }));
-    }
-
-    private ApiResponse HandleGetPeerCommunities(string peerIp)
-    {
-        var communities = _store.GetCommunitiesByIp(peerIp);
-        return ApiResponse.Ok(new
-        {
-            ip = peerIp,
-            communities = communities.Select(CommunityToString),
-            allRoutes = communities.Count == 0
-        });
-    }
-
-    private async Task<ApiResponse> HandleSetPeerCommunities(string peerIp, HttpListenerContext ctx)
-    {
-        var peer = _store.GetPeerByIp(peerIp);
-        if (peer is null)
-            return ApiResponse.Error("Peer not found", 404);
-
-        using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-        var body = await reader.ReadToEndAsync();
-        var data = JsonSerializer.Deserialize<SetCommunitiesRequest>(body);
-
-        if (data?.Communities is null)
-            return ApiResponse.Error("Invalid request body", 400);
-
-        var communities = new HashSet<uint>();
-        foreach (var c in data.Communities)
-            communities.Add(ParseCommunity(c));
-
-        _store.SetCommunities(peer.Id, communities);
-
-        _logger.LogInformation("Updated communities for {Peer}: {Communities}",
-            peerIp, string.Join(", ", communities.Select(CommunityToString)));
-
-        return ApiResponse.Ok(new { ip = peerIp, communities = communities.Select(CommunityToString) });
-    }
-
-    private async Task<ApiResponse> HandleSetPeerDescription(string peerIp, HttpListenerContext ctx)
-    {
-        var peer = _store.GetPeerByIp(peerIp);
-        if (peer is null)
-            return ApiResponse.Error("Peer not found", 404);
-
-        using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-        var body = await reader.ReadToEndAsync();
-        var data = JsonSerializer.Deserialize<SetDescriptionRequest>(body);
-
-        if (data?.Description is null)
-            return ApiResponse.Error("Invalid request body", 400);
-
-        _store.SetDescription(peer.Id, data.Description);
-
-        _logger.LogInformation("Updated description for {Peer}: {Desc}", peerIp, data.Description);
-
-        return ApiResponse.Ok(new { ip = peerIp, description = data.Description });
-    }
-
-    private ApiResponse HandleDeletePeerCommunities(string peerIp)
-    {
-        var peer = _store.GetPeerByIp(peerIp);
-        if (peer is null)
-            return ApiResponse.Error("Peer not found", 404);
-
-        _store.ClearCommunities(peer.Id);
-
-        _logger.LogInformation("Removed community filter for {Peer}", peerIp);
-        return ApiResponse.Ok(new { ip = peerIp, allRoutes = true });
-    }
-
-    private ApiResponse HandleGetRouteCount()
-    {
-        var routes = _routeTable.GetAll();
-        var byCommunity = routes
-            .SelectMany(r => r.Communities.Length == 0
-                ? [(community: 0u, route: r)]
-                : r.Communities.Select(c => (community: c, route: r)))
-            .GroupBy(x => x.community)
-            .ToDictionary(g => g.Key == 0 ? "default" : CommunityToString(g.Key), g => g.Count());
-
-        return ApiResponse.Ok(new { total = routes.Count, byCommunity });
-    }
+    #region /api/peers
 
     private async Task<ApiResponse> HandleCreatePeer(HttpListenerContext ctx)
     {
         using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
         var body = await reader.ReadToEndAsync();
-        var data = JsonSerializer.Deserialize<CreatePeerRequest>(body);
+        var data = JsonSerializer.Deserialize<CreatePeerRequest>(body, _jsonOpts);
 
         if (data is null)
             return ApiResponse.Error("Invalid request body", 400);
@@ -322,10 +298,13 @@ public sealed class ManagementApi : IHostedService, IDisposable
         if (customPrefixes.Count > 0)
             _store.SetCustomPrefixes(id, customPrefixes);
 
-        var peer = _store.GetPeerById(id);
+        var peer = _store.GetDbPeerById(id);
 
         _logger.LogInformation("Created peer {Ip} AS{Asn} ({Id}): {Subs} lists, {Prefixes} custom prefixes",
             data.Ip, data.Asn, id, asnLists.Count, customPrefixes.Count);
+
+        if (_sessionManager is not null)
+            _ = _sessionManager.RefreshPeerAsync(data.Ip);
 
         return ApiResponse.Ok(new
         {
@@ -335,10 +314,259 @@ public sealed class ManagementApi : IHostedService, IDisposable
             description = data.Description,
             status = peer?.Status ?? "inactive",
             createdAt = peer?.CreatedAt,
-            asnLists,
+            lists = asnLists,
             customPrefixes = data.CustomPrefixes ?? []
         });
     }
+
+    private ApiResponse HandleGetPeer(string peerId)
+    {
+        var peer = _store.GetDbPeerById(peerId);
+        if (peer is null)
+            return ApiResponse.Error("Peer not found", 404);
+
+        var subscriptions = _store.GetSubscriptions(peer.Id);
+        var customPrefixes = _store.GetCustomPrefixes(peer.Id);
+        var communities = _store.GetCommunitiesByIp(peer.Ip);
+
+        return ApiResponse.Ok(new
+        {
+            id = peer.Id,
+            ip = peer.Ip,
+            asn = peer.Asn,
+            description = peer.Description,
+            status = peer.Status,
+            createdAt = peer.CreatedAt,
+            lastSessionAt = peer.LastSessionAt,
+            lists = subscriptions,
+            customPrefixes,
+            communities = communities.Select(CommunityToString),
+            allRoutes = communities.Count == 0
+        });
+    }
+
+    private async Task<ApiResponse> HandleUpdatePeer(string peerId, HttpListenerContext ctx)
+    {
+        var peer = _store.GetDbPeerById(peerId);
+        if (peer is null)
+            return ApiResponse.Error("Peer not found", 404);
+
+        using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
+        var body = await reader.ReadToEndAsync();
+        var data = JsonSerializer.Deserialize<UpdatePeerRequest>(body, _jsonOpts);
+
+        if (data is null)
+            return ApiResponse.Error("Invalid request body", 400);
+
+        if (data.Description is not null)
+            _store.SetDescription(peerId, data.Description);
+
+        if (data.Lists is not null)
+            _store.SetSubscriptions(peerId, data.Lists);
+
+        if (data.CustomPrefixes is not null)
+        {
+            var parsed = new List<(string, byte)>();
+            foreach (var cidr in data.CustomPrefixes)
+            {
+                var slash = cidr.IndexOf('/');
+                if (slash < 0) return ApiResponse.Error($"Invalid CIDR: {cidr}", 400);
+                parsed.Add((cidr[..slash], byte.Parse(cidr[(slash + 1)..])));
+            }
+            _store.SetCustomPrefixes(peerId, parsed);
+        }
+
+        _logger.LogInformation("Updated peer {Id}", peerId);
+
+        if (_sessionManager is not null)
+            _ = _sessionManager.RefreshPeerAsync(peer.Ip);
+
+        return HandleGetPeer(peerId);
+    }
+
+    private ApiResponse HandleDeletePeer(string peerId)
+    {
+        var peer = _store.GetDbPeerById(peerId);
+        if (peer is null)
+            return ApiResponse.Error("Peer not found", 404);
+
+        _store.DeletePeer(peerId);
+        _logger.LogInformation("Deleted peer {Id} ({Ip})", peerId, peer.Ip);
+        return ApiResponse.Ok(new { id = peerId, deleted = true });
+    }
+
+    #endregion
+
+    #region /api/peers/{id}/prefixes
+
+    private ApiResponse HandleExportPrefixes(string peerId, HttpListenerContext ctx)
+    {
+        var peer = _store.GetDbPeerById(peerId);
+        if (peer is null)
+            return ApiResponse.Error("Peer not found", 404);
+
+        var prefixes = CollectPeerPrefixes(peerId).GetAwaiter().GetResult();
+
+        var format = ctx.Request.QueryString["format"] ?? "txt";
+        if (format == "json")
+            return ApiResponse.Ok(prefixes);
+
+        ctx.Response.ContentType = "text/plain";
+        return ApiResponse.Ok(string.Join("\n", prefixes));
+    }
+
+    private async Task<List<string>> CollectPeerPrefixes(string peerId)
+    {
+        var prefixes = new List<string>();
+
+        // Custom prefixes
+        prefixes.AddRange(_store.GetCustomPrefixes(peerId));
+
+        if (_prefixService is null)
+            return prefixes.Distinct().OrderBy(p => p).ToList();
+
+        var subscriptions = _store.GetSubscriptions(peerId);
+        var subscribedLists = _config.RipeStat?.AsnLists
+            .Where(l => subscriptions.Contains(l.Name))
+            .ToList() ?? [];
+
+        // ASN-based lists
+        var asns = subscribedLists.Where(l => l.Asns.Count > 0).SelectMany(l => l.Asns).ToList();
+        if (asns.Count > 0)
+        {
+            try
+            {
+                var fetched = await _prefixService.GetPrefixesForAsns(asns);
+                foreach (var (prefix, length, _) in fetched)
+                    prefixes.Add($"{BgpConstants.UintToIPAddress(prefix)}/{length}");
+            }
+            catch { }
+        }
+
+        // Country-based lists
+        if (subscribedLists.Any(l => l.Asns.Count == 0 && l.Country is not null))
+        {
+            try
+            {
+                var ruPrefixes = await _prefixService.GetRuPrefixesAsync();
+                foreach (var (prefix, length, _) in ruPrefixes)
+                    prefixes.Add($"{BgpConstants.UintToIPAddress(prefix)}/{length}");
+            }
+            catch { }
+        }
+
+        return prefixes.Distinct().OrderBy(p => p).ToList();
+    }
+
+    #endregion
+
+    #region /api/peers/{id}/communities
+
+    #endregion
+
+    #region GET /api/asn-lists
+
+    private async Task<ApiResponse> HandleGetAsnListsAsync()
+    {
+        var lists = _config.RipeStat?.AsnLists ?? [];
+        var result = new List<object>();
+
+        foreach (var l in lists)
+        {
+            int prefixCount = 0;
+            if (_prefixService is not null)
+            {
+                if (l.Asns.Count > 0)
+                {
+                    foreach (var asn in l.Asns)
+                    {
+                        try { prefixCount += await _prefixService.GetPrefixCountAsync(asn); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "Failed to get prefix count for AS{Asn}", asn); }
+                    }
+                }
+                else if (l.Country is not null)
+                {
+                    try { prefixCount = (await _prefixService.GetRuPrefixesAsync()).Count; }
+                    catch (Exception ex) { _logger.LogWarning(ex, "Failed to get RU prefix count"); }
+                }
+            }
+
+            result.Add(new
+            {
+                id = l.Name,
+                l.Name,
+                l.Description,
+                l.Country,
+                prefixCount,
+                type = l.Country is not null ? "country" : "asn"
+            });
+        }
+
+        return ApiResponse.Ok(result);
+    }
+
+    #endregion
+
+    #region GET /api/sessions
+
+    private ApiResponse HandleGetSessions()
+    {
+        return ApiResponse.Ok(new
+        {
+            active = _metrics.ActiveSessions
+        });
+    }
+
+    #endregion
+
+    #region GET /api/routes
+
+    private ApiResponse HandleGetRoutes()
+    {
+        var routes = _routeTable.GetAll();
+        var byCommunity = routes
+            .SelectMany(r => r.Communities.Length == 0
+                ? [(community: 0u, route: r)]
+                : r.Communities.Select(c => (community: c, route: r)))
+            .GroupBy(x => x.community)
+            .ToDictionary(g => g.Key == 0 ? "default" : CommunityToString(g.Key), g => g.Count());
+
+        return ApiResponse.Ok(new { total = routes.Count, byCommunity });
+    }
+
+    #endregion
+
+    #region GET /api/asns/{asn}/prefixes
+
+    private ApiResponse HandleGetAsnPrefixes(string asnStr, HttpListenerContext ctx)
+    {
+        if (!uint.TryParse(asnStr, out var asn))
+            return ApiResponse.Error("Invalid ASN", 400);
+
+        var countOnly = ctx.Request.QueryString["count"] == "true";
+
+        if (countOnly)
+        {
+            if (_prefixService is null)
+                return ApiResponse.Error("Prefix service not available", 503);
+
+            try
+            {
+                var count = _prefixService.GetPrefixCountAsync(asn).GetAwaiter().GetResult();
+                return ApiResponse.Ok(new { asn, prefixCount = count });
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse.Error(ex.Message, 500);
+            }
+        }
+
+        return ApiResponse.Ok(new { asn, message = "Use ?count=true for prefix count" });
+    }
+
+    #endregion
+
+    #region Helpers
 
     private static uint ParseCommunity(string community)
     {
@@ -350,9 +578,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     private static string CommunityToString(uint community)
     {
-        var asn = community >> 16;
-        var value = community & 0xFFFF;
-        return $"{asn}:{value}";
+        return $"{community >> 16}:{community & 0xFFFF}";
     }
 
     private static async Task WriteResponse(HttpListenerContext ctx, ApiResponse response)
@@ -372,6 +598,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
         ctx.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
     }
 
+    #endregion
+
     public void Dispose()
     {
         _cts.Cancel();
@@ -379,13 +607,14 @@ public sealed class ManagementApi : IHostedService, IDisposable
         _listener?.Close();
     }
 
-    private record SetCommunitiesRequest(List<string> Communities);
-    private record SetDescriptionRequest(string Description);
-    private record CreatePeerRequest(string Ip, uint Asn, string? Description, List<string>? AsnLists, List<string>? CustomPrefixes);
+    private record CreatePeerRequest(string Ip, uint Asn, string? Description, [property: JsonPropertyName("lists")] List<string>? AsnLists, List<string>? CustomPrefixes);
+    private record UpdatePeerRequest(string? Description, [property: JsonPropertyName("lists")] List<string>? Lists, List<string>? CustomPrefixes);
 
     private record ApiResponse(object? Body, int StatusCode = 200)
     {
         public static ApiResponse Ok(object data) => new(data);
         public static ApiResponse Error(string message, int code) => new(new { error = message }, code);
     }
+
+    private static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
 }

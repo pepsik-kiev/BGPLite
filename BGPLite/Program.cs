@@ -60,7 +60,15 @@ Console.WriteLine($"Peer database: {dbPath}");
 builder.Services.AddSingleton(config);
 builder.Services.AddSingleton(config.Bgp);
 builder.Services.AddSingleton(routeTable);
-builder.Services.AddSingleton(new BgpDbContext(dbPath));
+
+var db = new BgpDbContext(dbPath);
+var peerCount = db.Peers.Count();
+if (db.IsNewDatabase)
+    Console.WriteLine($"Created new database ({peerCount} peers)");
+else
+    Console.WriteLine($"Database loaded: {peerCount} peer(s)");
+
+builder.Services.AddSingleton(db);
 builder.Services.AddSingleton<PeerStore>();
 builder.Services.AddSingleton<IRouteFilter>(sp =>
 {
@@ -72,19 +80,21 @@ builder.Services.AddSingleton(new BgpMetrics());
 // Prefix provider (local nets.txt + RIPE Stat)
 if (config.RipeStat is { AsnLists.Count: > 0 })
     builder.Services.AddHttpClient<RipeStatProvider>(c => c.Timeout = TimeSpan.FromSeconds(30));
-builder.Services.AddSingleton(sp =>
+builder.Services.AddSingleton<IPrefixService>(sp =>
 {
     RipeStatProvider? ripe = null;
     try { ripe = sp.GetRequiredService<RipeStatProvider>(); } catch { }
     return new PrefixService(config, netsPath, ripe);
 });
 
+BgpServer? bgpServer = null;
+
 builder.Services.AddHostedService(sp =>
 {
     var store = sp.GetRequiredService<PeerStore>();
-    var prefixService = sp.GetRequiredService<PrefixService>();
+    var prefixService = sp.GetRequiredService<IPrefixService>();
 
-    return new BgpServer(
+    bgpServer = new BgpServer(
         sp.GetRequiredService<AppConfig>(),
         sp.GetRequiredService<RouteTable>(),
         sp.GetRequiredService<IRouteFilter>(),
@@ -94,7 +104,9 @@ builder.Services.AddHostedService(sp =>
         (ip, asn) => store.UpsertPeer(ip, asn),
         store,
         prefixService);
+    return bgpServer;
 });
+builder.Services.AddSingleton<ISessionManager>(sp => bgpServer!);
 builder.Services.AddHostedService<ManagementApi>();
 
 if (config.RipeStat is { AsnLists.Count: > 0 })

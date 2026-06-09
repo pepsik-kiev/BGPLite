@@ -12,6 +12,15 @@ public sealed class PeerStore : IPeerStore
 
     public string CreatePeer(string ip, uint asn, string? description)
     {
+        var existing = _db.Peers.FirstOrDefault(p => p.Ip == ip);
+        if (existing is not null)
+        {
+            existing.Asn = asn;
+            existing.Description = description;
+            _db.SaveChanges();
+            return existing.Id;
+        }
+
         var peer = new Peer { Ip = ip, Asn = asn, Description = description };
         _db.Peers.Add(peer);
         _db.SaveChanges();
@@ -52,8 +61,14 @@ public sealed class PeerStore : IPeerStore
     public List<Peer> GetAllPeers() =>
         _db.Peers.Include(p => p.Communities).ToList();
 
-    public Peer? GetPeerById(string id) =>
+    public Peer? GetDbPeerById(string id) =>
         _db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Id == id);
+
+    PeerInfo? IPeerStore.GetPeerById(string id)
+    {
+        var peer = GetDbPeerById(id);
+        return peer is null ? null : MapToInfo(peer);
+    }
 
     public PeerInfo? GetPeerByIp(string ip)
     {
@@ -103,6 +118,7 @@ public sealed class PeerStore : IPeerStore
     public void SetSubscriptions(string peerId, List<string> asnListNames)
     {
         _db.Set<PeerSubscription>().Where(s => s.PeerId == peerId).ExecuteDelete();
+        _db.ChangeTracker.Clear();
         _db.Set<PeerSubscription>().AddRange(
             asnListNames.Select(n => new PeerSubscription { PeerId = peerId, AsnListName = n }));
         _db.SaveChanges();

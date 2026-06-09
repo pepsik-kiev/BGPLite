@@ -8,6 +8,7 @@ public class BgpDbContext : DbContext
     private readonly string _dbPath;
 
     public DbSet<Peer> Peers => Set<Peer>();
+    public bool IsNewDatabase { get; }
 
     public BgpDbContext(string dbPath)
     {
@@ -15,6 +16,8 @@ public class BgpDbContext : DbContext
         var dir = Path.GetDirectoryName(dbPath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
             Directory.CreateDirectory(dir);
+
+        IsNewDatabase = !File.Exists(dbPath);
         Database.EnsureCreated();
 
         Peers.Where(p => p.Status == "active").ExecuteUpdate(

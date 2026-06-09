@@ -9,7 +9,7 @@ using Microsoft.Extensions.Logging;
 
 namespace BGPLite.Server;
 
-public sealed class BgpServer : IHostedService, IDisposable
+public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
 {
     private readonly AppConfig _config;
     private readonly RouteTable _routeTable;
@@ -152,6 +152,15 @@ public sealed class BgpServer : IHostedService, IDisposable
             _logger.LogInformation("Active sessions: {Count} [{Peers}]", _sessions.Count, peers);
         }
     }
+
+    public async Task RefreshPeerAsync(string peerIp)
+    {
+        if (_sessions.TryGetValue(peerIp, out var session) && session.IsEstablished)
+            await session.RefreshRoutesAsync();
+    }
+
+    public List<string> GetActivePeerIps() =>
+        _sessions.Where(kvp => kvp.Value.IsEstablished).Select(kvp => kvp.Key).ToList();
 
     public void Dispose()
     {

@@ -29,11 +29,55 @@ public sealed class BgpSession : IDisposable
     private bool _remoteFourByteAsn;
     private bool _localFourByteAsn = true;
     private ushort _negotiatedHoldTime;
+    private List<IpPrefix> _advertisedPrefixes = [];
     private TimeSpan _keepAliveInterval;
 
     public BgpFsmState State => _state;
     public PeerConfig Peer => _peerConfig;
     public bool IsEstablished => _state == BgpFsmState.Established;
+
+    public async Task RefreshRoutesAsync()
+    {
+        if (!IsEstablished) return;
+
+        await _sendLock.WaitAsync();
+        try
+        {
+            _logger.LogInformation("Refreshing routes for {Peer}", _peerConfig.Address);
+            await WithdrawAllAsync();
+            await SendAllRoutesAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to refresh routes for {Peer}", _peerConfig.Address);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
+    private async Task WithdrawAllAsync()
+    {
+        if (_advertisedPrefixes.Count == 0) return;
+
+        const int maxPerUpdate = 100;
+        for (var i = 0; i < _advertisedPrefixes.Count; i += maxPerUpdate)
+        {
+            var batch = _advertisedPrefixes.Skip(i).Take(maxPerUpdate).ToList();
+            var update = new BgpUpdateMessage
+            {
+                WithdrawnRoutes = batch,
+                PathAttributes = [],
+                Nlri = []
+            };
+            await SendMessageAsync(update);
+            _metrics.UpdateSent();
+        }
+
+        _logger.LogInformation("Withdrawn {Count} routes from {Peer}", _advertisedPrefixes.Count, _peerConfig.Address);
+        _advertisedPrefixes = [];
+    }
 
     public BgpSession(
         Socket socket,
@@ -156,6 +200,8 @@ public sealed class BgpSession : IDisposable
         }
     }
 
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+
     private async Task RunEstablishedAsync(CancellationToken cancellationToken)
     {
         using var keepaliveTimer = new PeriodicTimer(_keepAliveInterval);
@@ -275,11 +321,20 @@ public sealed class BgpSession : IDisposable
             {
                 _peerStore.UpdateSessionStatus(_peerConfig.Address, true);
 
-                var subscriptionNames = _peerStore.GetSubscriptions(peer.Id);
-                var asns = _appConfig.RipeStat?.AsnLists
-                    .Where(l => subscriptionNames.Contains(l.Name))
-                    .SelectMany(l => l.Asns)
+                var subscriptionIds = _peerStore.GetSubscriptions(peer.Id);
+                _logger.LogInformation("Peer {Peer} subscriptions: [{Subs}]", _peerConfig.Address, string.Join(", ", subscriptionIds));
+
+                var subscribedLists = _appConfig?.RipeStat?.AsnLists
+                    .Where(l => subscriptionIds.Contains(l.Name))
                     .ToList() ?? [];
+
+                // ASN-based lists
+                var asns = subscribedLists
+                    .Where(l => l.Asns.Count > 0)
+                    .SelectMany(l => l.Asns)
+                    .ToList();
+
+                _logger.LogInformation("Peer {Peer} resolved {Count} ASNs from subscriptions", _peerConfig.Address, asns.Count);
 
                 if (asns.Count > 0)
                 {
@@ -296,7 +351,7 @@ public sealed class BgpSession : IDisposable
                                 AsPath = [asn]
                             });
                         }
-                        _logger.LogInformation("Fetched {Count} prefixes for {Peer} from subscriptions",
+                        _logger.LogInformation("Fetched {Count} prefixes for {Peer} from ASN subscriptions",
                             routes.Count, _peerConfig.Address);
                     }
                     catch (Exception ex)
@@ -305,8 +360,34 @@ public sealed class BgpSession : IDisposable
                     }
                 }
 
+                // Country-based lists (e.g. RU with no ASNs → use local nets.txt)
+                if (subscribedLists.Any(l => l.Asns.Count == 0 && l.Country is not null))
+                {
+                    try
+                    {
+                        var ruPrefixes = await _prefixService.GetRuPrefixesAsync();
+                        foreach (var (prefix, length, _) in ruPrefixes)
+                        {
+                            routes.Add(new Route
+                            {
+                                Prefix = prefix,
+                                PrefixLength = length,
+                                NextHop = nextHop
+                            });
+                        }
+                        _logger.LogInformation("Fetched {Count} RU prefixes for {Peer}", ruPrefixes.Count, _peerConfig.Address);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to fetch RU prefixes for {Peer}", _peerConfig.Address);
+                    }
+                }
+
                 // Add custom prefixes
                 var customPrefixes = _peerStore.GetCustomPrefixes(peer.Id);
+                _logger.LogInformation("Peer {Peer} has {SubRoutes} subscription routes + {CustomCount} custom prefixes",
+                    _peerConfig.Address, routes.Count, customPrefixes.Count);
+
                 foreach (var cidr in customPrefixes)
                 {
                     var slash = cidr.IndexOf('/');
@@ -320,6 +401,8 @@ public sealed class BgpSession : IDisposable
                         NextHop = nextHop
                     });
                 }
+
+                _logger.LogInformation("Sending {Count} total routes to {Peer}", routes.Count, _peerConfig.Address);
 
                 if (routes.Count > 0)
                 {
@@ -400,6 +483,7 @@ public sealed class BgpSession : IDisposable
             sent += batch.Count;
         }
 
+        _advertisedPrefixes.AddRange(routes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)));
         _logger.LogInformation("UpdateSent {Count} routes to {Peer}", sent, _peerConfig.Address);
     }
 
