@@ -1,17 +1,19 @@
 # BGPLite
 
-Lightweight BGP route server with community-based filtering and HTTP management API.
+Lightweight BGP route server with dynamic prefix provisioning via RIPE Stat and HTTP management API.
 
-Built with .NET 10, designed for scenarios where you need to accept BGP sessions from peers, store routes, and control which routes each peer receives based on BGP communities.
+Built with .NET 10. Peers register through the API with subscriptions to AS-lists (Cloudflare, Google, Apple, Meta, etc.) or custom prefixes. On BGP connection, prefixes are fetched from RIPE Stat with caching and advertised to the peer.
 
 ## Features
 
 - BGP session management (OPEN, UPDATE, KEEPALIVE, NOTIFICATION)
 - 4-byte ASN support
-- Route table with prefix storage and community tagging
-- Per-peer community-based route filtering
-- HTTP management API for runtime configuration
-- SQLite peer store
+- Dynamic prefix provisioning via RIPE Stat API with in-memory caching
+- Per-peer AS-list subscriptions and custom prefix support
+- Local prefix provider (nets.txt) for RU prefixes
+- Auto-registration of unknown peers with default RU prefix set
+- HTTP management API for peer and route management
+- SQLite peer store via EF Core
 - Docker support
 
 ## Requirements
@@ -57,44 +59,132 @@ Peers:
   - Address: 10.0.0.2
     RemoteAsn: 65001
     Description: "example-peer"
-```
 
-The `Peers` section is optional — unconfigured peers can connect dynamically.
+RipeStat:
+  AsnLists:
+    - Name: cloudflare
+      Description: "AS13335 Cloudflare Inc."
+      Asns: [13335]
+
+    - Name: google
+      Description: "AS15169 Google LLC"
+      Asns: [15169]
+
+    - Name: apple
+      Description: "AS714 Apple Inc."
+      Asns: [714]
+
+    - Name: meta
+      Description: "AS32934 Facebook, Inc."
+      Asns: [32934]
+
+    - Name: ru
+      Description: "Russia"
+      Country: RU
+```
 
 ### Route Data
 
-Place prefix files in the working directory:
-
-- `nets.txt` — default routes (one prefix per line, e.g. `203.0.113.0/24`)
+- `nets.txt` — local RU prefixes (one CIDR per line, e.g. `2.16.20.0/23`)
 - `communities/` — community-tagged routes, files named `{ASN}_{value}.txt`
 
 ### Data Directory
 
 Peer data is stored in SQLite at `$BGPLITE_DATA/bgplite.db` (defaults to `./data`).
 
+## How It Works
+
+1. **Register a peer** via `POST /api/peers` with IP, ASN, AS-list subscriptions, and/or custom prefixes
+2. **Peer connects** via BGP to port 179
+3. **Session establishes** — the server looks up the peer in the database:
+   - If found → fetches prefixes for subscribed AS-lists from RIPE Stat (cached), adds custom prefixes, advertises all to the peer
+   - If not found → auto-registers the peer and advertises RU prefixes from `nets.txt`
+4. **Statistics updated** — peer status set to `active`, session time recorded
+
 ## Management API
 
-Available on port 5000:
+Available on port 5000.
+
+### Peers
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/peers` | List all connected peers |
-| GET | `/api/routes/count` | Route counts by community |
-| GET | `/api/peer/{ip}/communities` | Get peer community filter |
-| PUT | `/api/peer/{ip}/communities` | Set peer community filter |
-| DELETE | `/api/peer/{ip}/communities` | Clear community filter (accept all routes) |
-| PUT | `/api/peer/{ip}/description` | Set peer description |
+| `GET` | `/api/my-ip` | Returns client's IP address |
+| `POST` | `/api/peers` | Register a new peer |
+| `GET` | `/api/peers` | List all peers |
 
-### Examples
+#### Register a Peer
 
 ```bash
-# List peers
-curl http://localhost:5000/api/peers
+curl -X POST http://localhost:5000/api/peers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ip": "10.0.0.2",
+    "asn": 65001,
+    "description": "customer-1",
+    "asnLists": ["cloudflare", "google"],
+    "customPrefixes": ["203.0.113.0/24"]
+  }'
+```
 
-# Set community filter for a peer
+Response:
+
+```json
+{
+  "data": {
+    "id": "a1b2c3d4-...",
+    "ip": "10.0.0.2",
+    "asn": 65001,
+    "description": "customer-1",
+    "status": "inactive",
+    "createdAt": "2026-06-09T12:00:00Z",
+    "asnLists": ["cloudflare", "google"],
+    "customPrefixes": ["203.0.113.0/24"]
+  }
+}
+```
+
+#### List Peers
+
+```bash
+curl http://localhost:5000/api/peers
+```
+
+Returns peers with `id`, `ip`, `asn`, `description`, `status`, `createdAt`, `lastSessionAt`, `communities`.
+
+### AS Lists
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/asn-lists` | List available AS-lists with prefix counts |
+| `GET` | `/api/as/{asn}/prefixes/count` | Get prefix count for a specific ASN |
+
+```bash
+curl http://localhost:5000/api/asn-lists
+curl http://localhost:5000/api/as/13335/prefixes/count
+```
+
+### Sessions & Routes
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/sessions` | Active BGP session count |
+| `GET` | `/api/routes/count` | Route counts by community |
+
+### Peer Management (Legacy)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/peer/{ip}/communities` | Get peer community filter |
+| `PUT` | `/api/peer/{ip}/communities` | Set peer community filter |
+| `DELETE` | `/api/peer/{ip}/communities` | Clear community filter |
+| `PUT` | `/api/peer/{ip}/description` | Set peer description |
+
+```bash
+# Set community filter
 curl -X PUT http://localhost:5000/api/peer/10.0.0.2/communities \
   -H 'Content-Type: application/json' \
-  -d '{"communities": ["65444:100", "65444:200"]}'
+  -d '{"communities": ["65444:100"]}'
 
 # Route statistics
 curl http://localhost:5000/api/routes/count
@@ -104,13 +194,15 @@ curl http://localhost:5000/api/routes/count
 
 ```
 BGPLite/
-├── BGPLite/              # Entry point, host setup
-├── BGPLite.Protocol/     # BGP message encoding/decoding
-├── BGPLite.Server/       # TCP listener, BGP session FSM
-├── BGPLite.Routing/      # Route table, community filters
-├── BGPLite.Configuration/ # YAML config loading
-├── BGPLite.Api/          # Management HTTP API, peer store
-└── BGPLite.Tests/        # Unit tests
+├── BGPLite/               # Entry point, host setup, DI
+├── BGPLite.Api/           # Management HTTP API, peer store (EF Core)
+│   └── Entities/          # EF Core entity models
+├── BGPLite.Configuration/ # YAML config loading, AppConfig models
+├── BGPLite.Protocol/      # BGP message encoding/decoding
+├── BGPLite.Providers/     # PrefixService (caching), RipeStatProvider
+├── BGPLite.Routing/       # Route table, community filters
+├── BGPLite.Server/        # TCP listener, BGP session FSM
+└── BGPLite.Tests/         # Unit tests
 ```
 
 ## License
