@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using BGPLite.Api.Entities;
 using BGPLite.Configuration;
+using BGPLite.Providers;
 using BGPLite.Routing;
 using BGPLite.Server;
 using Microsoft.Extensions.Hosting;
@@ -16,6 +17,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
     private readonly RouteTable _routeTable;
     private readonly AppConfig _config;
     private readonly BgpMetrics _metrics;
+    private readonly PrefixService? _prefixService;
     private readonly ILogger<ManagementApi> _logger;
     private HttpListener? _listener;
     private Task? _listenTask;
@@ -26,12 +28,14 @@ public sealed class ManagementApi : IHostedService, IDisposable
         RouteTable routeTable,
         AppConfig config,
         BgpMetrics metrics,
-        ILogger<ManagementApi> logger)
+        ILogger<ManagementApi> logger,
+        PrefixService? prefixService = null)
     {
         _store = store;
         _routeTable = routeTable;
         _config = config;
         _metrics = metrics;
+        _prefixService = prefixService;
         _logger = logger;
     }
 
@@ -89,7 +93,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
                 response = ApiResponse.Ok(new { ip = clientIp });
             }
             else if (method == "GET" && path == "/api/asn-lists")
-                response = HandleGetAsnLists();
+                response = await HandleGetAsnListsAsync();
             else if (method == "GET" && path == "/api/sessions")
                 response = HandleGetSessions();
             else if (method == "POST" && path == "/api/peers")
@@ -117,17 +121,35 @@ public sealed class ManagementApi : IHostedService, IDisposable
         }
     }
 
-    private ApiResponse HandleGetAsnLists()
+    private async Task<ApiResponse> HandleGetAsnListsAsync()
     {
         var lists = _config.RipeStat?.AsnLists ?? [];
-        return ApiResponse.Ok(lists.Select(l => new
+        var result = new List<object>();
+
+        foreach (var l in lists)
         {
-            l.Name,
-            l.Description,
-            l.Country,
-            asns = l.Asns,
-            type = l.Country is not null ? "country" : "asn"
-        }));
+            int prefixCount = 0;
+            if (_prefixService is not null)
+            {
+                foreach (var asn in l.Asns)
+                {
+                    try { prefixCount += await _prefixService.GetPrefixCountAsync(asn); }
+                    catch { }
+                }
+            }
+
+            result.Add(new
+            {
+                id = l.Id,
+                l.Name,
+                l.Description,
+                l.Country,
+                prefixCount,
+                type = l.Country is not null ? "country" : "asn"
+            });
+        }
+
+        return ApiResponse.Ok(result);
     }
 
     private ApiResponse HandleGetSessions()

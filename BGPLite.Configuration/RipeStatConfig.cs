@@ -10,6 +10,8 @@ public sealed class RipeStatConfig
 
 public sealed class AsnList
 {
+    public string Id { get; init; } = Guid.NewGuid().ToString();
+
     [YamlMember(Alias = "Name")]
     public string Name { get; init; } = "";
 

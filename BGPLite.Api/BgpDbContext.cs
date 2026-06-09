@@ -16,6 +16,9 @@ public class BgpDbContext : DbContext
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
             Directory.CreateDirectory(dir);
         Database.EnsureCreated();
+
+        Peers.Where(p => p.Status == "active").ExecuteUpdate(
+            s => s.SetProperty(p => p.Status, "inactive"));
     }
 
     protected override void OnConfiguring(DbContextOptionsBuilder options)

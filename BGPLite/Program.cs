@@ -71,13 +71,16 @@ builder.Services.AddSingleton(new BgpMetrics());
 
 // RIPE Stat prefix provider
 if (config.RipeStat is { AsnLists.Count: > 0 })
+{
     builder.Services.AddHttpClient<RipeStatProvider>(c => c.Timeout = TimeSpan.FromSeconds(30));
+    builder.Services.AddSingleton<PrefixService>();
+}
 
 builder.Services.AddHostedService(sp =>
 {
     var store = sp.GetRequiredService<PeerStore>();
-    RipeStatProvider? ripe = null;
-    try { ripe = sp.GetRequiredService<RipeStatProvider>(); } catch { }
+    PrefixService? prefixService = null;
+    try { prefixService = sp.GetRequiredService<PrefixService>(); } catch { }
 
     return new BgpServer(
         sp.GetRequiredService<AppConfig>(),
@@ -88,7 +91,7 @@ builder.Services.AddHostedService(sp =>
         sp.GetRequiredService<ILogger<BgpServer>>(),
         (ip, asn) => store.UpsertPeer(ip, asn),
         store,
-        ripe);
+        prefixService);
 });
 builder.Services.AddHostedService<ManagementApi>();
 

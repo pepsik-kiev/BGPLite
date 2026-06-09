@@ -23,7 +23,7 @@ public sealed class BgpSession : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Action<string, uint>? _onPeerIdentified;
     private readonly PeerStore? _peerStore;
-    private readonly RipeStatProvider? _ripeStatProvider;
+    private readonly PrefixService? _prefixService;
     private readonly AppConfig? _appConfig;
 
     private BgpFsmState _state = BgpFsmState.Idle;
@@ -47,7 +47,7 @@ public sealed class BgpSession : IDisposable
         ILogger<BgpSession> logger,
         Action<string, uint>? onPeerIdentified = null,
         PeerStore? peerStore = null,
-        RipeStatProvider? ripeStatProvider = null,
+        PrefixService? prefixService = null,
         AppConfig? appConfig = null)
     {
         _socket = socket;
@@ -60,7 +60,7 @@ public sealed class BgpSession : IDisposable
         _logger = logger;
         _onPeerIdentified = onPeerIdentified;
         _peerStore = peerStore;
-        _ripeStatProvider = ripeStatProvider;
+        _prefixService = prefixService;
         _appConfig = appConfig;
     }
 
@@ -270,8 +270,7 @@ public sealed class BgpSession : IDisposable
         var nextHop = BgpConstants.IPAddressToUint(_bgpConfig.GetRouterIdAddress());
         var routes = new List<Route>();
 
-        // Try dynamic route fetching from peer subscriptions
-        if (_peerStore is not null && _ripeStatProvider is not null && _appConfig is not null)
+        if (_peerStore is not null && _prefixService is not null && _appConfig is not null)
         {
             var peer = _peerStore.GetPeerByIp(_peerConfig.Address);
             if (peer is not null)
@@ -279,35 +278,32 @@ public sealed class BgpSession : IDisposable
                 _peerStore.UpdateSessionStatus(_peerConfig.Address, true);
 
                 var subscriptionNames = _peerStore.GetSubscriptions(peer.Id);
-                var asnLists = _appConfig.RipeStat?.AsnLists
+                var asns = _appConfig.RipeStat?.AsnLists
                     .Where(l => subscriptionNames.Contains(l.Name))
+                    .SelectMany(l => l.Asns)
                     .ToList() ?? [];
 
-                // Fetch prefixes for each subscribed AS list
-                foreach (var asnList in asnLists)
+                if (asns.Count > 0)
                 {
-                    foreach (var asn in asnList.Asns)
+                    try
                     {
-                        try
+                        var prefixes = await _prefixService.GetPrefixesForAsns(asns);
+                        foreach (var (prefix, length, asn) in prefixes)
                         {
-                            var prefixes = await _ripeStatProvider.GetPrefixesAsync(asn);
-                            foreach (var (prefix, length) in prefixes)
+                            routes.Add(new Route
                             {
-                                routes.Add(new Route
-                                {
-                                    Prefix = prefix,
-                                    PrefixLength = length,
-                                    NextHop = nextHop,
-                                    AsPath = [asn]
-                                });
-                            }
-                            _logger.LogInformation("Fetched {Count} prefixes for AS{Asn} ({List}) for {Peer}",
-                                prefixes.Count, asn, asnList.Name, _peerConfig.Address);
+                                Prefix = prefix,
+                                PrefixLength = length,
+                                NextHop = nextHop,
+                                AsPath = [asn]
+                            });
                         }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Failed to fetch prefixes for AS{Asn} for {Peer}", asn, _peerConfig.Address);
-                        }
+                        _logger.LogInformation("Fetched {Count} prefixes for {Peer} from subscriptions",
+                            routes.Count, _peerConfig.Address);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to fetch prefixes for {Peer}", _peerConfig.Address);
                     }
                 }
 
@@ -333,9 +329,49 @@ public sealed class BgpSession : IDisposable
                     return;
                 }
             }
+            else
+            {
+                // Unknown peer — auto-register and send default RU list
+                _logger.LogInformation("Unknown peer {Ip}, auto-registering with RU defaults", _peerConfig.Address);
+
+                _peerStore.CreatePeer(_peerConfig.Address, _remoteAsn, null);
+
+                var ruAsns = _appConfig.RipeStat?.AsnLists
+                    .Where(l => l.Country == "RU")
+                    .SelectMany(l => l.Asns)
+                    .ToList();
+
+                if (ruAsns is { Count: > 0 })
+                {
+                    try
+                    {
+                        var prefixes = await _prefixService.GetPrefixesForAsns(ruAsns);
+                        foreach (var (prefix, length, asn) in prefixes)
+                        {
+                            routes.Add(new Route
+                            {
+                                Prefix = prefix,
+                                PrefixLength = length,
+                                NextHop = nextHop,
+                                AsPath = [asn]
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to fetch RU prefixes for {Peer}", _peerConfig.Address);
+                    }
+                }
+
+                if (routes.Count > 0)
+                {
+                    await SendRoutesAsync(nextHop, routes);
+                    return;
+                }
+            }
         }
 
-        // Fallback: send from shared route table
+        // Final fallback: send from shared route table
         var tableRoutes = _routeTable.GetAll();
         if (tableRoutes.Count == 0) return;
 
