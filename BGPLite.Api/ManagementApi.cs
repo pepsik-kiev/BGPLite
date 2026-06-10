@@ -196,13 +196,23 @@ public sealed class ManagementApi : IHostedService, IDisposable
             },
             bird = new[]
             {
+                $"# ---------- FILTER ----------",
+                $"filter bgplite_in {{",
+                $"  gw = <YOUR_GATEWAY>;",
+                $"  accept;",
+                $"}}",
+                $"",
+                $"# ---------- eBGP ----------",
                 $"protocol bgp bgplite {{",
-                $"  local as {bgp.Asn};",
-                $"  neighbor {ip} port 179;",
-                $"  multihop 2;",
+                $"  local as <YOUR_ASN>;",
+                $"  neighbor {ip} as {bgp.Asn};",
+                $"  source address <YOUR_IP>;",
+                $"  multihop;",
+                $"  hold time {bgp.HoldTime};",
                 $"  ipv4 {{",
-                $"    import all;",
+                $"    import filter bgplite_in;",
                 $"    export none;",
+                $"    graceful restart on;",
                 $"  }};",
                 $"}}"
             },
@@ -210,15 +220,13 @@ public sealed class ManagementApi : IHostedService, IDisposable
             {
                 $"/routing bgp connection",
                 $"add name=bgplite remote.address={ip}/32 remote.as={bgp.Asn}",
-                $"  local.role=ebgp local.as={bgp.Asn}",
-                $"  hold-time={bgp.HoldTime}s keepalive-time={bgp.KeepAlive}s",
-                $"  as4-capability=yes add-path-out=none",
-                $"  multihop=yes",
-                $"  in.filter=bgplite-in out.filter=bgplite-out",
+                $"  local.default-address=<YOUR_IP> local.role=ebgp",
+                $"  as=<YOUR_ASN> multihop=yes hold-time={bgp.HoldTime}s afi=ip",
+                $"  output.filter-chain=discard output.no-client-to-client-reflection=yes",
+                $"  input.filter=bgplite-in",
                 $"!",
                 $"/routing filter rule",
-                $"add chain=bgplite-in action=accept set-in-nexthop-direct=yes",
-                $"add chain=bgplite-out action=discard"
+                $"add chain=bgplite-in action=accept set-in-nexthop-direct=yes"
             }
         });
     }
