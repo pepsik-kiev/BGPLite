@@ -289,6 +289,11 @@ public sealed class ManagementApi : IHostedService, IDisposable
         var asnLists = data.AsnLists ?? [];
         var customPrefixes = new List<(string Prefix, byte Length)>();
 
+        _logger.LogInformation("CreatePeer raw body: {Body}", body);
+        _logger.LogInformation("CreatePeer deserialized: AsnLists={Lists}, CustomPrefixes={Prefixes}, CustomAsns={Asns}",
+            string.Join(",", asnLists), string.Join(",", data.CustomPrefixes ?? []),
+            string.Join(",", data.CustomAsns ?? []));
+
         if (data.CustomPrefixes is not null)
         {
             foreach (var cidr in data.CustomPrefixes)
@@ -303,12 +308,9 @@ public sealed class ManagementApi : IHostedService, IDisposable
         }
 
         var id = _store.CreatePeer(data.Ip, data.Asn, data.Description);
-        if (asnLists.Count > 0)
-            _store.SetSubscriptions(id, asnLists);
-        if (customPrefixes.Count > 0)
-            _store.SetCustomPrefixes(id, customPrefixes);
-        if (data.CustomAsns is { Count: > 0 })
-            _store.SetCustomAsns(id, data.CustomAsns);
+        _store.SetSubscriptions(id, asnLists);
+        _store.SetCustomPrefixes(id, customPrefixes);
+        _store.SetCustomAsns(id, data.CustomAsns ?? []);
 
         var peer = _store.GetDbPeerById(id);
 
@@ -380,6 +382,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
             _store.SetSubscriptions(peerId, data.Lists);
 
         var customPrefixes = data.CustomPrefixes ?? [];
+        _logger.LogInformation("UpdatePeer {Id}: CustomPrefixes={Count}, CustomAsns={AsnCount}, raw={Raw}",
+            peerId, customPrefixes.Count, (data.CustomAsns ?? []).Count, body);
         var parsed = new List<(string, byte)>();
         foreach (var cidr in customPrefixes)
         {
