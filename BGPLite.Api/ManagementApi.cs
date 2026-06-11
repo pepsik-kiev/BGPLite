@@ -379,20 +379,17 @@ public sealed class ManagementApi : IHostedService, IDisposable
         if (data.Lists is not null)
             _store.SetSubscriptions(peerId, data.Lists);
 
-        if (data.CustomPrefixes is not null)
+        var customPrefixes = data.CustomPrefixes ?? [];
+        var parsed = new List<(string, byte)>();
+        foreach (var cidr in customPrefixes)
         {
-            var parsed = new List<(string, byte)>();
-            foreach (var cidr in data.CustomPrefixes)
-            {
-                var slash = cidr.IndexOf('/');
-                if (slash < 0) return ApiResponse.Error($"Invalid CIDR: {cidr}", 400);
-                parsed.Add((cidr[..slash], byte.Parse(cidr[(slash + 1)..])));
-            }
-            _store.SetCustomPrefixes(peerId, parsed);
+            var slash = cidr.IndexOf('/');
+            if (slash < 0) return ApiResponse.Error($"Invalid CIDR: {cidr}", 400);
+            parsed.Add((cidr[..slash], byte.Parse(cidr[(slash + 1)..])));
         }
+        _store.SetCustomPrefixes(peerId, parsed);
 
-        if (data.CustomAsns is not null)
-            _store.SetCustomAsns(peerId, data.CustomAsns);
+        _store.SetCustomAsns(peerId, data.CustomAsns ?? []);
 
         _logger.LogInformation("Updated peer {Id}", peerId);
 
