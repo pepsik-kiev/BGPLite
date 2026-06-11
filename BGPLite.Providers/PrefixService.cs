@@ -66,16 +66,18 @@ public sealed class PrefixService : IPrefixService
         if (_localPrefixes is not null)
             return Task.FromResult(_localPrefixes.Select(p => (p.Prefix, p.Length, 0u)).ToList());
 
-        // Fallback: если нет локального файла, попробуем RIPE
-        if (_ripeStat is null) return Task.FromResult(new List<(uint, byte, uint)>());
+        return Task.FromResult(new List<(uint, byte, uint)>());
 
-        var ruAsns = _config.RipeStat?.AsnLists
-            .Where(l => l.Country == "RU")
-            .SelectMany(l => l.Asns)
-            .ToList();
-
-        if (ruAsns is null or { Count: 0 }) return Task.FromResult(new List<(uint, byte, uint)>());
-        return GetPrefixesForAsns(ruAsns);
+        // // Fallback: если нет локального файла, попробуем RIPE
+        // if (_ripeStat is null) return Task.FromResult(new List<(uint, byte, uint)>());
+        //
+        // var ruAsns = _config.RipeStat?.AsnLists
+        //     .Where(l => l.Country == "RU")
+        //     .SelectMany(l => l.Asns)
+        //     .ToList();
+        //
+        // if (ruAsns is null or { Count: 0 }) return Task.FromResult(new List<(uint, byte, uint)>());
+        // return GetPrefixesForAsns(ruAsns);
     }
 
     public async Task WarmUpAsync()
