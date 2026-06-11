@@ -445,38 +445,28 @@ public sealed class BgpSession : IDisposable
 
                 _peerStore.CreatePeer(_peerConfig.Address, _remoteAsn, null);
 
-                var ruAsns = _appConfig.RipeStat?.AsnLists
-                    .Where(l => l.Country == "RU")
-                    .SelectMany(l => l.Asns)
-                    .ToList();
-
-                if (ruAsns is { Count: > 0 })
+                try
                 {
-                    try
+                    var ruPrefixes = await _prefixService.GetRuPrefixesAsync();
+                    foreach (var (prefix, length, _) in ruPrefixes)
                     {
-                        var prefixes = await _prefixService.GetPrefixesForAsns(ruAsns);
-                        foreach (var (prefix, length, asn) in prefixes)
+                        routes.Add(new Route
                         {
-                            routes.Add(new Route
-                            {
-                                Prefix = prefix,
-                                PrefixLength = length,
-                                NextHop = nextHop,
-                                AsPath = [asn]
-                            });
-                        }
+                            Prefix = prefix,
+                            PrefixLength = length,
+                            NextHop = nextHop
+                        });
                     }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to fetch RU prefixes for {Peer}", _peerConfig.Address);
-                    }
+                    _logger.LogInformation("Fetched {Count} RU prefixes for unknown peer {Peer}",
+                        ruPrefixes.Count, _peerConfig.Address);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to fetch RU prefixes for {Peer}", _peerConfig.Address);
                 }
 
-                if (routes.Count > 0)
-                {
-                    await SendRoutesAsync(nextHop, routes);
-                    return;
-                }
+                await SendRoutesAsync(nextHop, routes);
+                return;
             }
         }
 
