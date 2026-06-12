@@ -155,8 +155,20 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
 
     public async Task RefreshPeerAsync(string peerIp)
     {
-        if (_sessions.TryGetValue(peerIp, out var session) && session.IsEstablished)
-            await session.RefreshRoutesAsync();
+        if (!_sessions.TryGetValue(peerIp, out var session))
+        {
+            _logger.LogWarning("RefreshPeer: no session for {Ip} (active: [{Peers}])",
+                peerIp, string.Join(", ", _sessions.Keys));
+            return;
+        }
+
+        if (!session.IsEstablished)
+        {
+            _logger.LogWarning("RefreshPeer: session for {Ip} not established (state={State})", peerIp, session.State);
+            return;
+        }
+
+        await session.RefreshRoutesAsync();
     }
 
     public List<string> GetActivePeerIps() =>
