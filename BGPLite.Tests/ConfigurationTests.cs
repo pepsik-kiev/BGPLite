@@ -67,4 +67,108 @@ public class ConfigurationTests
         Assert.Equal(180, config.Bgp.HoldTime);
         Assert.Empty(config.Peers);
     }
+
+    [Fact]
+    public void LoadFromText_ParsesPrefixSources_File()
+    {
+        var yaml = """
+            Bgp:
+              Asn: 65444
+              RouterId: 10.0.0.1
+            PrefixSources:
+              - Kind: file
+                Name: ru
+                Path: nets.txt
+                Community: "65000:100"
+            DefaultPrefixSource: ru
+            """;
+
+        var config = ConfigLoader.LoadFromText(yaml);
+
+        var src = Assert.Single(config.PrefixSources);
+        Assert.Equal("file", src.Kind);
+        Assert.Equal("ru", src.Name);
+        Assert.Equal("nets.txt", src.Path);
+        Assert.Equal("65000:100", src.Community);
+        Assert.Equal("ru", config.DefaultPrefixSource);
+    }
+
+    [Fact]
+    public void LoadFromText_ParsesPrefixSources_Http()
+    {
+        var yaml = """
+            Bgp:
+              Asn: 65444
+              RouterId: 10.0.0.1
+            PrefixSources:
+              - Kind: http
+                Name: cf
+                Url: "https://raw.githubusercontent.com/o/r/main/cf.txt"
+            """;
+
+        var config = ConfigLoader.LoadFromText(yaml);
+
+        var src = Assert.Single(config.PrefixSources);
+        Assert.Equal("http", src.Kind);
+        Assert.Equal("cf", src.Name);
+        Assert.Equal("https://raw.githubusercontent.com/o/r/main/cf.txt", src.Url);
+    }
+
+    [Fact]
+    public void LoadFromText_ParsesPrefixSources_HttpOptions()
+    {
+        var yaml = """
+            Bgp:
+              Asn: 65444
+              RouterId: 10.0.0.1
+            PrefixSources:
+              - Kind: http
+                Name: data
+                Url: "https://data.org/list.txt"
+                Timeout: 60
+                Headers:
+                  Authorization: "Bearer token"
+                  X-API-Key: "key123"
+            """;
+
+        var config = ConfigLoader.LoadFromText(yaml);
+
+        var src = Assert.Single(config.PrefixSources);
+        Assert.Equal(60, src.Timeout);
+        Assert.NotNull(src.Headers);
+        Assert.Equal("Bearer token", src.Headers!["Authorization"]);
+        Assert.Equal("key123", src.Headers!["X-API-Key"]);
+    }
+
+    [Fact]
+    public void LoadFromText_PrefixSources_DefaultKindIsFile()
+    {
+        var yaml = """
+            Bgp:
+              Asn: 65444
+              RouterId: 10.0.0.1
+            PrefixSources:
+              - Name: x
+                Path: x.txt
+            """;
+
+        var config = ConfigLoader.LoadFromText(yaml);
+
+        Assert.Equal("file", config.PrefixSources[0].Kind);
+    }
+
+    [Fact]
+    public void LoadFromText_NoPrefixSourcesByDefault()
+    {
+        var yaml = """
+            Bgp:
+              Asn: 65444
+              RouterId: 10.0.0.1
+            """;
+
+        var config = ConfigLoader.LoadFromText(yaml);
+
+        Assert.Empty(config.PrefixSources);
+        Assert.Null(config.DefaultPrefixSource);
+    }
 }

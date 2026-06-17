@@ -8,3 +8,25 @@ Peers:
   - Address: 10.0.0.1
     RemoteAsn: 65001
     Description: "example-peer"
+
+# Prefix sources loaded at startup via the provider factory (Kind: file | http).
+# "http" fetches any direct raw-file URL (raw.githubusercontent.com, a gist, self-hosted, ...).
+# Each source may override the HTTP timeout (Timeout, seconds) and tag a Community in "ASN:VALUE".
+# Results are cached in memory (TTL 1h).
+PrefixSources:
+  - Kind: http
+    Name: ru
+    Description: "Russia prefixes from a remote list"
+    Url: "https://raw.githubusercontent.com/<org>/<repo>/main/ru.txt"
+    Timeout: 30
+    # Headers:                    # optional request headers (Authorization, X-API-Key, ...)
+    #   Authorization: "Bearer <token>"
+
+  - Kind: file
+    Name: local
+    Description: "Local override list"
+    Path: "extra.txt"
+    Community: "65444:100"
+
+# Name of the source served as the RU/default set for unconfigured peers.
+DefaultPrefixSource: ru

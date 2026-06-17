@@ -1,4 +1,3 @@
-using System.Net;
 using BGPLite.Api;
 using BGPLite.Configuration;
 using BGPLite.Protocol;
@@ -7,7 +6,6 @@ using BGPLite.Routing;
 using BGPLite.Server;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -21,38 +19,6 @@ var config = ConfigLoader.Load(configPath);
 
 var routeTable = new RouteTable();
 var nextHop = BgpConstants.IPAddressToUint(config.Bgp.GetRouterIdAddress());
-
-// Load default nets.txt (no community)
-var netsPath = Path.Combine(baseDir, "nets.txt");
-if (File.Exists(netsPath))
-{
-    var count = LoadPrefixes(netsPath, nextHop, [], routeTable);
-    Console.WriteLine($"Loaded {count} prefixes from nets.txt");
-}
-else
-{
-    Console.WriteLine($"nets.txt not found at {netsPath}");
-}
-
-// Load community files from communities/ directory
-var communitiesDir = Path.Combine(baseDir, "communities");
-if (Directory.Exists(communitiesDir))
-{
-    foreach (var file in Directory.GetFiles(communitiesDir, "*.txt"))
-    {
-        var fileName = Path.GetFileNameWithoutExtension(file);
-        var underscore = fileName.IndexOf('_');
-        if (underscore < 0) continue;
-
-        var asn = uint.Parse(fileName[..underscore]);
-        var value = uint.Parse(fileName[(underscore + 1)..]);
-        var community = (asn << 16) | (value & 0xFFFF);
-        var communities = new uint[] { community };
-
-        var count = LoadPrefixes(file, nextHop, communities, routeTable);
-        Console.WriteLine($"Loaded {count} prefixes with community {asn}:{value} from {fileName}.txt");
-    }
-}
 
 // SQLite peer store
 var dbPath = Path.Combine(dataDir, "bgplite.db");
@@ -76,14 +42,32 @@ builder.Services.AddSingleton<IRouteFilter>(sp =>
 });
 builder.Services.AddSingleton(new BgpMetrics());
 
-// Prefix provider (local nets.txt + RIPE Stat)
-if (config.RipeStat is { AsnLists.Count: > 0 })
-    builder.Services.AddHttpClient<RipeStatProvider>(c => c.Timeout = TimeSpan.FromSeconds(30));
+// Prefix sources (file / HTTP / ...) resolved by Kind via a provider factory,
+// with an in-memory TTL cache. Add a new loader by implementing IPrefixSourceProvider
+// and registering it here.
+builder.Services.AddHttpClient(HttpPrefixProvider.ClientName, c =>
+{
+    c.Timeout = TimeSpan.FromSeconds(30);
+    c.DefaultRequestHeaders.UserAgent.ParseAdd("BGPLite/1.0");
+});
+builder.Services.AddSingleton<HttpPrefixProvider>();
+builder.Services.AddSingleton<FilePrefixProvider>();
+builder.Services.AddSingleton<IPrefixSourceProvider>(sp => sp.GetRequiredService<HttpPrefixProvider>());
+builder.Services.AddSingleton<IPrefixSourceProvider>(sp => sp.GetRequiredService<FilePrefixProvider>());
+builder.Services.AddSingleton<PrefixSourceProviderFactory>();
+builder.Services.AddSingleton<PrefixSourceService>();
+builder.Services.AddSingleton<IPrefixSourceService>(sp => sp.GetRequiredService<PrefixSourceService>());
+
+// RIPE Stat provider — registered unconditionally so arbitrary ASNs (peer custom ASNs,
+// API lookups) can be resolved on demand, regardless of preconfigured RipeStat.AsnLists.
+builder.Services.AddHttpClient(RipeStatProvider.ClientName, c => c.Timeout = TimeSpan.FromSeconds(30));
+builder.Services.AddSingleton<RipeStatProvider>();
+
 builder.Services.AddSingleton<IPrefixService>(sp =>
 {
-    RipeStatProvider? ripe = null;
-    try { ripe = sp.GetRequiredService<RipeStatProvider>(); } catch { }
-    return new PrefixService(config, netsPath, ripe);
+    var ripe = sp.GetRequiredService<RipeStatProvider>();
+    var sources = sp.GetRequiredService<IPrefixSourceService>();
+    return new PrefixService(config, ripe, sources);
 });
 
 BgpServer? bgpServer = null;
@@ -133,30 +117,23 @@ using (var scope = host.Services.CreateScope())
 
 var logger = host.Services.GetRequiredService<ILogger<Program>>();
 logger.LogInformation("BGPLite starting — ASN={Asn}, RouterId={RouterId}", config.Bgp.Asn, config.Bgp.RouterId);
-logger.LogInformation("Loaded routes: {RouteCount}", routeTable.Count);
 
-// Pre-warm prefix cache before accepting BGP connections
+// Pre-warm prefix cache before accepting BGP connections (RIPE + all configured sources)
 Console.WriteLine("Warming up prefix cache...");
 var prefixService = host.Services.GetRequiredService<IPrefixService>();
 await prefixService.WarmUpAsync();
 Console.WriteLine("Prefix cache ready");
 
-await host.RunAsync();
-return;
-
-static int LoadPrefixes(string path, uint nextHop, uint[] communities, RouteTable routeTable)
+// Seed the route table from configured prefix sources, attaching each source's community.
+var sourceSvc = host.Services.GetRequiredService<IPrefixSourceService>();
+foreach (var (source, prefixes) in await sourceSvc.LoadAllAsync())
 {
-    var count = 0;
-    foreach (var line in File.ReadLines(path))
+    var communities = string.IsNullOrEmpty(source.Community)
+        ? Array.Empty<uint>()
+        : new[] { CommunityCodec.Parse(source.Community!) };
+
+    foreach (var (prefix, length) in prefixes)
     {
-        var trimmed = line.Trim();
-        if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith('#')) continue;
-
-        var slash = trimmed.IndexOf('/');
-        var ip = IPAddress.Parse(trimmed[..slash]);
-        var length = byte.Parse(trimmed[(slash + 1)..]);
-        var prefix = BgpConstants.IPAddressToUint(ip);
-
         routeTable.AddOrUpdate(new Route
         {
             Prefix = prefix,
@@ -164,7 +141,13 @@ static int LoadPrefixes(string path, uint nextHop, uint[] communities, RouteTabl
             NextHop = nextHop,
             Communities = communities
         });
-        count++;
     }
-    return count;
+
+    Console.WriteLine($"  Source '{source.Name}': {prefixes.Count} prefixes" +
+                      (source.Community is null ? "" : $" community={source.Community}"));
 }
+
+logger.LogInformation("Loaded routes: {RouteCount}", routeTable.Count);
+
+await host.RunAsync();
+return;

@@ -23,7 +23,6 @@
 
   <ItemGroup>
     <None Include="..\appsettings.yml" Link="appsettings.yml" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\nets.txt" Link="nets.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

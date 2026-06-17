@@ -1,25 +1,21 @@
 using System.Net;
 using System.Text.Json;
 using BGPLite.Protocol;
+using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Logging;
 
 namespace BGPLite.Providers;
 
-public sealed class RipeStatProvider
+public sealed class RipeStatProvider(IHttpClientFactory httpFactory, ILogger<RipeStatProvider> logger)
 {
-    private readonly HttpClient _http;
-    private readonly ILogger<RipeStatProvider> _logger;
-
-    public RipeStatProvider(HttpClient http, ILogger<RipeStatProvider> logger)
-    {
-        _http = http;
-        _logger = logger;
-    }
+    /// <summary>Named-client key registered with <c>IHttpClientFactory</c>.</summary>
+    public const string ClientName = "ripestat";
 
     public async Task<IReadOnlyList<(uint Prefix, byte PrefixLength)>> GetPrefixesAsync(uint asn, CancellationToken ct = default)
     {
         var url = $"https://stat.ripe.net/data/ris-prefixes/data.json?resource=AS{asn}&list_prefixes=true";
-        using var response = await _http.GetAsync(url, ct);
+        var http = httpFactory.CreateClient(ClientName);
+        using var response = await http.GetAsync(url, ct);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync(ct);
@@ -43,7 +39,7 @@ public sealed class RipeStatProvider
             result.Add((prefix, length));
         }
 
-        _logger.LogInformation("AS{Asn}: fetched {Count} prefixes", asn, result.Count);
+        logger.LogInformation("AS{Asn}: fetched {Count} prefixes", asn, result.Count);
         return result;
     }
 }
