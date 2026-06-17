@@ -222,15 +222,11 @@ public sealed class ManagementApi : IHostedService, IDisposable
             },
             mikrotik = new[]
             {
-                $"/routing bgp connection",
-                $"add name=bgplite remote.address={ip}/32 remote.as={bgp.Asn}",
-                $"  local.default-address=<YOUR_IP> local.role=ebgp",
-                $"  as=<YOUR_ASN> multihop=yes hold-time={bgp.HoldTime}s afi=ip",
-                $"  output.filter-chain=discard output.no-client-to-client-reflection=yes",
-                $"  input.filter=bgplite-in",
-                $"!",
-                $"/routing filter rule",
-                $"add chain=bgplite-in action=accept set-in-nexthop-direct=yes"
+                $"# Apply all lines as-is — full paths => one paste. v7 ties a connection to a BGP instance; output.filter-chain=discard announces nothing back.",
+                $"/routing/bgp/instance/add name=bgplite as=<YOUR_ASN> router-id=<YOUR_ROUTER_ID>",
+                $"/routing/filter/rule/add chain=discard rule=\"reject;\"",
+                $"/routing/filter/rule/add chain=bgplite-in rule=\"set gw <YOUR_GW>; accept;\"",
+                $"/routing/bgp/connection/add name=bgplite instance=bgplite afi=ip remote.address={ip}/32 remote.as={bgp.Asn} local.role=ebgp hold-time={bgp.HoldTime}s output.filter-chain=discard input.filter=bgplite-in"
             }
         });
     }
