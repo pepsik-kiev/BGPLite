@@ -419,6 +419,36 @@ public sealed class BgpSession : IDisposable
                     }
                 }
 
+                // Prefix-source subscriptions: subscribed names that aren't RIPE ASN/country lists but
+                // match a configured PrefixSource (e.g. "microsoft", "aws"). "ru" is already resolved
+                // as a country list above, so it isn't fetched twice.
+                var resolvedAsRipe = subscribedLists.Select(l => l.Name).ToHashSet();
+                var sourceNames = subscriptionIds
+                    .Where(n => !resolvedAsRipe.Contains(n) && _appConfig!.PrefixSources.Any(s => s.Name == n))
+                    .ToList();
+                foreach (var name in sourceNames)
+                {
+                    try
+                    {
+                        var srcPrefixes = await _prefixService.GetSourcePrefixesAsync(name);
+                        foreach (var (prefix, length) in srcPrefixes)
+                        {
+                            routes.Add(new Route
+                            {
+                                Prefix = prefix,
+                                PrefixLength = length,
+                                NextHop = nextHop
+                            });
+                        }
+                        _logger.LogInformation("Fetched {Count} prefixes from source '{Source}' for {Peer}",
+                            srcPrefixes.Count, name, _peerConfig.Address);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to fetch source '{Source}' for {Peer}", name, _peerConfig.Address);
+                    }
+                }
+
                 // Add custom prefixes (already loaded above)
                 _logger.LogInformation("Peer {Peer} has {SubRoutes} subscription routes + {CustomCount} custom prefixes",
                     _peerConfig.Address, routes.Count, customPrefixes.Count);

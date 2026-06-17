@@ -64,6 +64,10 @@ public sealed class PrefixService : IPrefixService
         return prefixes.Select(p => (p.Prefix, p.Length, 0u)).ToList();
     }
 
+    /// <summary>Prefixes of a configured source by name (cache-through).</summary>
+    public Task<IReadOnlyList<(uint Prefix, byte Length)>> GetSourcePrefixesAsync(string name) =>
+        _prefixSources.GetAsync(name);
+
     public async Task WarmUpAsync()
     {
         var lists = _config.RipeStat?.AsnLists ?? [];
