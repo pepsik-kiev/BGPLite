@@ -1,5 +1,4 @@
 using System.Buffers.Binary;
-using System.Net;
 
 namespace BGPLite.Protocol;
 
@@ -24,25 +23,29 @@ public static class AttributeHelper
     {
         var ases = new List<uint>();
         var offset = 0;
-        while (offset < attr.Data.Length)
+        var asSize = fourByteAsn ? 4 : 2;
+
+        while (offset + 2 <= attr.Data.Length)
         {
+            // segment header: [type][length]
             var segmentType = attr.Data[offset++];
             var segmentLength = attr.Data[offset++];
 
+            var segBytes = segmentLength * asSize;
+            if (offset + segBytes > attr.Data.Length)
+                break; // truncated segment — stop rather than read out of bounds
+
             for (var i = 0; i < segmentLength; i++)
             {
-                if (fourByteAsn && offset + 4 <= attr.Data.Length)
-                {
+                if (fourByteAsn)
                     ases.Add(BinaryPrimitives.ReadUInt32BigEndian(attr.Data.AsSpan(offset)));
-                    offset += 4;
-                }
-                else if (offset + 2 <= attr.Data.Length)
-                {
+                else
                     ases.Add(BinaryPrimitives.ReadUInt16BigEndian(attr.Data.AsSpan(offset)));
-                    offset += 2;
-                }
+                offset += asSize;
             }
         }
+        // NOTE: AS4_PATH (attr 17) is not parsed/merged here; AS_PATH is not re-advertised
+        // by this server, so AS_TRANS(23456) reconstruction (RFC 6793 §6) is unnecessary.
         return ases.ToArray();
     }
 
