@@ -171,4 +171,50 @@ public class ConfigurationTests
         Assert.Empty(config.PrefixSources);
         Assert.Null(config.DefaultPrefixSource);
     }
+
+    [Fact]
+    public void LoadFromText_RipeStatDefaults_WhenSectionAbsent()
+    {
+        var yaml = """
+            Bgp:
+              Asn: 65444
+              RouterId: 10.0.0.1
+            """;
+
+        var config = ConfigLoader.LoadFromText(yaml);
+
+        Assert.Null(config.RipeStat);
+        // The provider falls back to these defaults when the section is absent.
+        Assert.Equal(180, RipeStatConfig.DefaultTimeoutSeconds);
+        Assert.Equal(180, new RipeStatConfig().TimeoutSeconds);
+        Assert.Equal(2, new RipeStatConfig().RetryAttempts);
+    }
+
+    [Fact]
+    public void LoadFromText_ParsesRipeStatOptions()
+    {
+        var yaml = """
+            Bgp:
+              Asn: 65444
+              RouterId: 10.0.0.1
+            RipeStat:
+              TimeoutSeconds: 300
+              RetryAttempts: 4
+              RetryDelaySeconds: 5
+              AsnLists:
+                - Name: tier1
+                  Description: "Tier-1 transit"
+                  Asns: [3356, 1299]
+            """;
+
+        var config = ConfigLoader.LoadFromText(yaml);
+
+        Assert.NotNull(config.RipeStat);
+        Assert.Equal(300, config.RipeStat!.TimeoutSeconds);
+        Assert.Equal(4, config.RipeStat.RetryAttempts);
+        Assert.Equal(5, config.RipeStat.RetryDelaySeconds);
+        var list = Assert.Single(config.RipeStat.AsnLists);
+        Assert.Equal("tier1", list.Name);
+        Assert.Equal(new uint[] { 3356, 1299 }, list.Asns);
+    }
 }

@@ -60,8 +60,20 @@ builder.Services.AddSingleton<IPrefixSourceService>(sp => sp.GetRequiredService<
 
 // RIPE Stat provider — registered unconditionally so arbitrary ASNs (peer custom ASNs,
 // API lookups) can be resolved on demand, regardless of preconfigured RipeStat.AsnLists.
-builder.Services.AddHttpClient(RipeStatProvider.ClientName, c => c.Timeout = TimeSpan.FromSeconds(30));
-builder.Services.AddSingleton<RipeStatProvider>();
+// The ris-prefixes endpoint can take minutes to respond for large origin ASes (e.g. AS3356 /
+// Lumen), so the timeout is configurable and defaults to a generous value. Fall back to the
+// built-in defaults when the RipeStat section is absent — the provider still serves ad-hoc
+// lookups, and its retry handles transient failures (timeouts, 429/5xx).
+var ripeStatConfig = config.RipeStat ?? new RipeStatConfig();
+builder.Services.AddHttpClient(RipeStatProvider.ClientName, c =>
+{
+    c.Timeout = TimeSpan.FromSeconds(ripeStatConfig.TimeoutSeconds);
+    c.DefaultRequestHeaders.UserAgent.ParseAdd("BGPLite/1.0");
+});
+builder.Services.AddSingleton(sp => new RipeStatProvider(
+    sp.GetRequiredService<IHttpClientFactory>(),
+    sp.GetRequiredService<ILogger<RipeStatProvider>>(),
+    ripeStatConfig));
 
 builder.Services.AddSingleton<IPrefixService>(sp =>
 {

@@ -9,6 +9,19 @@ Peers:
     RemoteAsn: 65001
     Description: "example-peer"
 
+# RIPEstat (stat.ripe.net) used to resolve ASNs → prefixes via the ris-prefixes endpoint.
+# That endpoint is slow for large origin ASes (AS3356/Lumen takes ~2 minutes), so the HTTP
+# timeout defaults to 180s and is tunable here. Transient failures (timeout, HTTP 429/5xx)
+# are retried with exponential backoff.
+RipeStat:
+  TimeoutSeconds: 180        # per-request HTTP timeout (default 180)
+  RetryAttempts: 2           # retries after a transient failure (default 2, 0 disables)
+  RetryDelaySeconds: 2       # base delay between retries, doubled each attempt (default 2)
+  # AsnLists:               # pre-warmed ASN groups at startup
+  #   - Name: tier1
+  #     Description: "Tier-1 transit ASes"
+  #     Asns: [3356, 1299]
+
 # Prefix sources loaded at startup via the provider factory (Kind: file | http).
 # "http" fetches any direct raw-file URL (raw.githubusercontent.com, a gist, self-hosted, ...).
 # Each source may override the HTTP timeout (Timeout, seconds) and tag a Community in "ASN:VALUE".
