@@ -120,7 +120,9 @@ public class GracefulRestartTests
     {
         var open = new BgpOpenMessage
         {
-            Asn = 65001, HoldTime = 180, RouterId = 0x0A000001,
+            Asn = 65001,
+            HoldTime = 180,
+            RouterId = 0x0A000001,
             Capabilities = [BgpCapabilityInfo.FourOctetAsn(65001)]
         };
         Assert.Null(CapabilityHelper.GetGracefulRestart(open));
