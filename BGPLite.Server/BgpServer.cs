@@ -23,6 +23,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
     private readonly IPrefixAggregator _prefixAggregator;
     private readonly ConcurrentDictionary<string, BgpSession> _sessions = new();
     private readonly CancellationTokenSource _cts = new();
+    private int _acceptingConnections = 1;
     private Socket? _listener;
     private Task? _acceptTask;
     private PeriodicTimer? _statusTimer;
@@ -77,12 +78,36 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
     {
         _logger.LogInformation("BGP server shutting down");
 
+        // Stop accepting new connections before we snapshot/mark the current sessions.
+        // Otherwise a connection that sneaks in between the GR mark loop and _cts.Cancel()
+        // can miss SilentClose and later emit a protocol-incorrect Cease.
+        Volatile.Write(ref _acceptingConnections, 0);
+
+        if (_listener is not null)
+        {
+            _listener.Close();
+        }
+
+        if (_acceptTask is not null)
+        {
+            try { await _acceptTask; }
+            catch { }
+        }
+
         // Graceful Restart-aware shutdown (RFC 4724 §4): a NOTIFICATION termination bypasses GR, so
         // send a Cease only when GR is disabled — peers then tear down cleanly instead of waiting on
         // the hold timer. With GR enabled we deliberately just drop the TCP connection so peers
         // engage GR and retain our routes across the restart. Must run BEFORE _cts.Cancel() tears
-        // the sessions down.
-        if (!_config.Bgp.GracefulRestart)
+        // the sessions down: the sessions' RunAsync finally-blocks would otherwise see no teardown
+        // reason (None) and emit a best-effort Cease — which would bypass GR exactly as a Cease would.
+        // MarkSilentClose latches SilentClose and cancels each session's own CTS so the read/keepalive
+        // loops stop promptly, then _cts.Cancel() handles the accept loop and anything still pending.
+        if (_config.Bgp.GracefulRestart)
+        {
+            foreach (var session in _sessions.Values)
+                session.MarkSilentClose();
+        }
+        else
         {
             var ceases = _sessions.Values
                 .Where(s => s.IsEstablished)
@@ -94,22 +119,11 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
 
         _cts.Cancel();
 
-        if (_listener is not null)
-        {
-            _listener.Close();
-            _listener = null;
-        }
-
         foreach (var session in _sessions.Values)
         {
             session.Dispose();
         }
         _sessions.Clear();
-
-        if (_acceptTask is not null)
-        {
-            try { await _acceptTask; } catch { }
-        }
 
         _statusTimer?.Dispose();
         if (_statusTask is not null)
@@ -138,13 +152,78 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
                     _onPeerIdentified,
                     _peerStore, _prefixService, _config, _prefixAggregator);
 
-                _sessions[peerAddress] = session;
+                if (Volatile.Read(ref _acceptingConnections) == 0)
+                {
+                    session.Dispose();
+                    break;
+                }
 
-                _ = RunSessionAsync(peerAddress, session, cancellationToken);
+                // TryAdd first so a racing replacement from the same peer doesn't get clobbered
+                // (an older session's finally still owns the key). If an existing session is present
+                // it is the older one — silently close it and swap. max-active is not enforced at
+                // accept in this codebase, so the simple swap is safe.
+                //
+                // Replacement policy: the old session must actually stop, not just be told to Cease.
+                // The previous fire-and-forget NotifyCeaseAsync only latched the Cease and wrote bytes;
+                // it never cancelled the old session's CTS, so the read/keepalive loops kept running
+                // until the peer closed the socket or the hold timer fired. MarkSilentClose latches
+                // SilentClose (so the old RunAsync finally emits no NOTIFICATION — RFC 4724 §4 / §8.1)
+                // AND cancels the old CTS so the loops unwind promptly. We do NOT send a Cease on
+                // replacement: the peer is reconnecting right now and a Cease to the old socket is
+                // noise (and, with GR enabled, would bypass GR). The peer sees a TCP close instead.
+                //
+                // Use TryUpdate (atomic CAS) for the replacement so two concurrent accept threads
+                // for the same peer cannot both pass TryGetValue and both install their session.
+                // If the CAS fails, another thread already swapped the entry — retry from the top.
+                var sessionRegistered = _sessions.TryAdd(peerAddress, session);
+                if (!sessionRegistered)
+                {
+                    while (!cancellationToken.IsCancellationRequested && Volatile.Read(ref _acceptingConnections) != 0)
+                    {
+                        if (_sessions.TryGetValue(peerAddress, out var existing))
+                        {
+                            // Atomic CAS: only swap if the registered value is still 'existing'.
+                            // If another accept thread already swapped it, TryUpdate returns false
+                            // and we retry (the losing session is already started via RunSessionAsync
+                            // and must be disposed — but since TryAdd failed, we know a session for
+                            // this peer is registered; the retry loop ensures we eventually replace
+                            // whatever is there).
+                            if (_sessions.TryUpdate(peerAddress, session, existing))
+                            {
+                                _logger.LogInformation("Replacing existing session for {Peer}", peerAddress);
+                                existing.MarkSilentClose();
+                                sessionRegistered = true;
+                                break;
+                            }
+                            // CAS failed — another thread replaced it; loop and retry.
+                        }
+                        else
+                        {
+                            // Existing was concurrently removed — try to add ours.
+                            if (_sessions.TryAdd(peerAddress, session))
+                            {
+                                sessionRegistered = true;
+                                break;
+                            }
+                            // TryAdd failed — another thread re-added for this peer; loop and retry.
+                        }
+                    }
+
+                    if (!sessionRegistered)
+                    {
+                        session.Dispose();
+                        break;
+                    }
+                }
+
+                if (sessionRegistered)
+                    _ = RunSessionAsync(peerAddress, session, cancellationToken);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
+                if (Volatile.Read(ref _acceptingConnections) == 0)
+                    break;
                 _logger.LogError(ex, "Error accepting connection");
             }
         }
@@ -158,9 +237,33 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
         }
         finally
         {
-            _sessions.TryRemove(peerAddress, out _);
+            // Atomically remove our registration ONLY if we are still the current session for this
+            // peer. The previous TryGetValue + TryRemove was not atomic: a racing re-accept could
+            // install a newer session between those two calls, and our TryRemove would then erase
+            // the newer session from the dictionary. ConcurrentDictionary has no public
+            // TryRemove(key, expectedValue), but its explicit ICollection<KeyValuePair<TKey,TValue>>
+            // implementation removes the pair only when both key AND value match — an atomic
+            // compare-and-remove. So a newer session installed after our exit is left untouched.
+            RemoveSessionIfOwner(peerAddress, session);
             session.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Atomically removes <paramref name="session"/> from <see cref="_sessions"/> only if it is
+    /// still the registered session for <paramref name="peerAddress"/>. Uses the explicit
+    /// <see cref="ICollection{T}"/>.Remove on ConcurrentDictionary, which is documented to remove
+    /// the pair only when both key and value match — a compare-and-remove that closes the race the
+    /// earlier TryGetValue+TryRemove had (a newer re-accepted session would otherwise be erased).
+    /// </summary>
+    private void RemoveSessionIfOwner(string peerAddress, BgpSession session)
+    {
+        var removed = ((ICollection<KeyValuePair<string, BgpSession>>)_sessions)
+            .Remove(new KeyValuePair<string, BgpSession>(peerAddress, session));
+        if (removed)
+            _logger.LogDebug("Removed session for {Peer} (we owned it)", peerAddress);
+        else
+            _logger.LogDebug("Did not remove session for {Peer} (replaced by a newer session)", peerAddress);
     }
 
     private async Task LogStatusLoopAsync(CancellationToken cancellationToken)
@@ -195,9 +298,9 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
 
     public void Dispose()
     {
+        Volatile.Write(ref _acceptingConnections, 0);
+        _listener?.Close();
         _cts.Cancel();
-        _cts.Dispose();
-        _listener?.Dispose();
         foreach (var session in _sessions.Values)
             session.Dispose();
     }
