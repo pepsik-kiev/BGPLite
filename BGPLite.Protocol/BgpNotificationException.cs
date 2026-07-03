@@ -6,8 +6,11 @@ namespace BGPLite.Protocol;
 /// (per RFC 4271 §6) so the session handler sends the right ones instead of a generic
 /// Message Header Error.
 /// </summary>
-public sealed class BgpNotificationException(byte errorCode, byte subErrorCode, string message) : Exception(message)
+public sealed class BgpNotificationException(byte errorCode, byte subErrorCode, string message, byte[]? notificationData = null) : Exception(message)
 {
+    private readonly byte[]? _notificationData = notificationData is null ? null : (byte[])notificationData.Clone();
+
     public byte ErrorCode { get; } = errorCode;
     public byte SubErrorCode { get; } = subErrorCode;
+    public byte[]? NotificationData => _notificationData is null ? null : (byte[])_notificationData.Clone();
 }
