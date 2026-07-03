@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Threading.RateLimiting;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using BGPLite.Api.Entities;
@@ -25,6 +26,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
     private readonly ILogger<ManagementApi> _logger;
     private readonly int _port;
     private readonly IReadOnlyList<IPNetwork> _trustedProxyNetworks;
+    private readonly PartitionedRateLimiter<string>? _rateLimiter;
     private HttpListener? _listener;
     private Task? _listenTask;
     private CancellationTokenSource _cts = new();
@@ -49,6 +51,9 @@ public sealed class ManagementApi : IHostedService, IDisposable
         _logger = logger;
         _port = config.ApiPort;
         _trustedProxyNetworks = ParseTrustedProxies(config.TrustedProxies);
+        // Opt-in (#116): no rate limiting unless an ApiRateLimit section is configured, so the live
+        // service's behavior is unchanged until the operator enables it.
+        _rateLimiter = config.ApiRateLimit is { Enabled: true } cfg ? CreateRateLimiter(cfg) : null;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -101,6 +106,19 @@ public sealed class ManagementApi : IHostedService, IDisposable
             ctx.Response.StatusCode = 204;
             ctx.Response.Close();
             return;
+        }
+
+        // Per-client-IP rate limit (#116) — 429 once the resolved client's token bucket is drained.
+        if (_rateLimiter is not null)
+        {
+            var clientIp = GetClientIp(ctx);
+            using var lease = await _rateLimiter.AcquireAsync(clientIp);
+            if (!lease.IsAcquired)
+            {
+                _logger.LogWarning("API rate limit exceeded for {Ip}", clientIp);
+                await WriteResponse(ctx, ApiResponse.Error("Too many requests", 429));
+                return;
+            }
         }
 
         var path = ctx.Request.Url!.AbsolutePath;
@@ -641,6 +659,27 @@ public sealed class ManagementApi : IHostedService, IDisposable
             _trustedProxyNetworks);
 
     /// <summary>
+    /// Builds the per-client-IP token-bucket rate limiter for the management API (#116). Each distinct
+    /// resolved client IP (see <see cref="GetClientIp"/>) gets its own token bucket; a request is
+    /// rejected with 429 once its bucket is exhausted. Tunable via <see cref="ApiRateLimitConfig"/>; the
+    /// limiter is only created when the operator opts in (ApiRateLimit section present + Enabled).
+    /// Extracted as a pure factory for unit tests.
+    /// </summary>
+    internal static PartitionedRateLimiter<string> CreateRateLimiter(ApiRateLimitConfig cfg)
+    {
+        var options = new TokenBucketRateLimiterOptions
+        {
+            TokenLimit = Math.Max(1, cfg.TokenLimit),
+            TokensPerPeriod = Math.Max(1, cfg.TokensPerPeriod),
+            ReplenishmentPeriod = TimeSpan.FromSeconds(Math.Max(1, cfg.PeriodSeconds)),
+            QueueLimit = 0,         // deny immediately (429) when no tokens — never queue
+            AutoReplenishment = true
+        };
+        return PartitionedRateLimiter.Create<string, string>(
+            ip => RateLimitPartition.GetTokenBucketLimiter(ip, _ => options));
+    }
+
+    /// <summary>
     /// Resolves the real client IP from the connection's remote endpoint and forwarding headers.
     /// Forwarding headers are honored ONLY when the immediate peer (<paramref name="remote"/>) is a
     /// configured trusted proxy (#91) — a direct client cannot inject <c>X-Forwarded-For</c> /
@@ -681,8 +720,10 @@ public sealed class ManagementApi : IHostedService, IDisposable
         }
 
         // Single-hop proxies commonly set X-Real-IP instead of (or alongside) X-Forwarded-For.
-        if (!string.IsNullOrWhiteSpace(xRealIp))
-            return xRealIp.Trim();
+        // Validate + normalize so a malformed header can't surface garbage (e.g. newlines for log
+        // forging) — fall back to the proxy address if it isn't a parseable IP.
+        if (!string.IsNullOrWhiteSpace(xRealIp) && IPAddress.TryParse(xRealIp.Trim(), out var realAddr))
+            return Normalize(realAddr).ToString();
 
         return remote.ToString();
     }
