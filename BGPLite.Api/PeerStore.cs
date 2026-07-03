@@ -63,26 +63,26 @@ public sealed class PeerStore : IPeerStore
     public List<Peer> GetAllPeers()
     {
         using var db = _dbFactory.CreateDbContext();
-        return db.Peers.Include(p => p.Communities).ToList();
+        return db.Peers.AsNoTracking().Include(p => p.Communities).ToList();
     }
 
     public Peer? GetDbPeerById(string id)
     {
         using var db = _dbFactory.CreateDbContext();
-        return db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Id == id);
+        return db.Peers.AsNoTracking().Include(p => p.Communities).FirstOrDefault(p => p.Id == id);
     }
 
     PeerInfo? IPeerStore.GetPeerById(string id)
     {
         using var db = _dbFactory.CreateDbContext();
-        var peer = db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Id == id);
+        var peer = db.Peers.AsNoTracking().Include(p => p.Communities).FirstOrDefault(p => p.Id == id);
         return peer is null ? null : MapToInfo(peer);
     }
 
     public PeerInfo? GetPeerByIp(string ip)
     {
         using var db = _dbFactory.CreateDbContext();
-        var peer = db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Ip == ip);
+        var peer = db.Peers.AsNoTracking().Include(p => p.Communities).FirstOrDefault(p => p.Ip == ip);
         return peer is null ? null : MapToInfo(peer);
     }
 
@@ -94,7 +94,7 @@ public sealed class PeerStore : IPeerStore
     public PeerInfo? GetPeer(string ip, uint asn)
     {
         using var db = _dbFactory.CreateDbContext();
-        var peer = db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Ip == ip && p.Asn == asn);
+        var peer = db.Peers.AsNoTracking().Include(p => p.Communities).FirstOrDefault(p => p.Ip == ip && p.Asn == asn);
         return peer is null ? null : MapToInfo(peer);
     }
 
@@ -105,30 +105,33 @@ public sealed class PeerStore : IPeerStore
             s => s.SetProperty(p => p.Description, description));
     }
 
+    // AsNoTracking is a read-only-intent marker here — a no-op for this scalar projection (no entities are materialized to track).
     public HashSet<uint> GetCommunities(string peerId)
     {
         using var db = _dbFactory.CreateDbContext();
-        return db.Peers.Include(p => p.Communities)
+        return db.Peers.AsNoTracking().Include(p => p.Communities)
             .Where(p => p.Id == peerId)
             .SelectMany(p => p.Communities)
             .Select(c => (uint)c.Community)
             .ToHashSet();
     }
 
+    // AsNoTracking is a read-only-intent marker here — a no-op for this scalar projection (no entities are materialized to track).
     public HashSet<uint> GetCommunities(string ip, uint asn)
     {
         using var db = _dbFactory.CreateDbContext();
-        return db.Peers.Include(p => p.Communities)
+        return db.Peers.AsNoTracking().Include(p => p.Communities)
             .Where(p => p.Ip == ip && p.Asn == asn)
             .SelectMany(p => p.Communities)
             .Select(c => (uint)c.Community)
             .ToHashSet();
     }
 
+    // AsNoTracking is a read-only-intent marker here — a no-op for this scalar projection (no entities are materialized to track).
     public HashSet<uint> GetCommunitiesByIp(string ip)
     {
         using var db = _dbFactory.CreateDbContext();
-        return db.Peers.Include(p => p.Communities)
+        return db.Peers.AsNoTracking().Include(p => p.Communities)
             .Where(p => p.Ip == ip)
             .SelectMany(p => p.Communities)
             .Select(c => (uint)c.Community)
@@ -150,10 +153,11 @@ public sealed class PeerStore : IPeerStore
         db.Set<PeerCommunity>().Where(c => c.PeerId == peerId).ExecuteDelete();
     }
 
+    // AsNoTracking is a read-only-intent marker here — a no-op for this scalar projection (no entities are materialized to track).
     public List<string> GetSubscriptions(string peerId)
     {
         using var db = _dbFactory.CreateDbContext();
-        return db.Set<PeerSubscription>()
+        return db.Set<PeerSubscription>().AsNoTracking()
             .Where(s => s.PeerId == peerId)
             .Select(s => s.AsnListName)
             .ToList();
@@ -168,10 +172,11 @@ public sealed class PeerStore : IPeerStore
         db.SaveChanges();
     }
 
+    // AsNoTracking is a read-only-intent marker here — a no-op for this scalar projection (no entities are materialized to track).
     public List<string> GetCustomPrefixes(string peerId)
     {
         using var db = _dbFactory.CreateDbContext();
-        return db.Set<PeerCustomPrefix>()
+        return db.Set<PeerCustomPrefix>().AsNoTracking()
             .Where(c => c.PeerId == peerId)
             .Select(c => c.Prefix + "/" + c.PrefixLength)
             .ToList();
@@ -186,10 +191,11 @@ public sealed class PeerStore : IPeerStore
         db.SaveChanges();
     }
 
+    // AsNoTracking is a read-only-intent marker here — a no-op for this scalar projection (no entities are materialized to track).
     public List<uint> GetCustomAsns(string peerId)
     {
         using var db = _dbFactory.CreateDbContext();
-        return db.Set<PeerCustomAsn>()
+        return db.Set<PeerCustomAsn>().AsNoTracking()
             .Where(c => c.PeerId == peerId)
             .Select(c => c.Asn)
             .ToList();
