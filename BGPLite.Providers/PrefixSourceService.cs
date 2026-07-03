@@ -44,7 +44,7 @@ public sealed class PrefixSourceService : IPrefixSourceService
         _negativeTtl = negativeTtl ?? TimeSpan.FromSeconds(30);
     }
 
-    public async Task<IReadOnlyList<(uint Prefix, byte Length)>> GetAsync(string name)
+    public async Task<IReadOnlyList<(uint Prefix, byte Length)>> GetAsync(string name, CancellationToken ct = default)
     {
         var source = _config.PrefixSources.FirstOrDefault(s => s.Name == name);
         if (source is null)
@@ -53,7 +53,8 @@ public sealed class PrefixSourceService : IPrefixSourceService
             return [];
         }
 
-        try { return await LoadCachedAsync(source); }
+        try { return await LoadCachedAsync(source, ct); }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to load prefix source '{Name}'.", name);
@@ -61,7 +62,7 @@ public sealed class PrefixSourceService : IPrefixSourceService
         }
     }
 
-    public async Task<IReadOnlyList<(uint Prefix, byte Length)>> GetDefaultAsync()
+    public async Task<IReadOnlyList<(uint Prefix, byte Length)>> GetDefaultAsync(CancellationToken ct = default)
     {
         var defaultName = _config.DefaultPrefixSource;
         if (string.IsNullOrWhiteSpace(defaultName))
@@ -74,7 +75,8 @@ public sealed class PrefixSourceService : IPrefixSourceService
             return [];
         }
 
-        try { return await LoadCachedAsync(source); }
+        try { return await LoadCachedAsync(source, ct); }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to load default prefix source '{Name}'.", defaultName);
@@ -82,13 +84,14 @@ public sealed class PrefixSourceService : IPrefixSourceService
         }
     }
 
-    public async Task<IReadOnlyList<(PrefixSourceConfig Source, IReadOnlyList<(uint Prefix, byte Length)> Prefixes)>> LoadAllAsync()
+    public async Task<IReadOnlyList<(PrefixSourceConfig Source, IReadOnlyList<(uint Prefix, byte Length)> Prefixes)>> LoadAllAsync(CancellationToken ct = default)
     {
         var result = new List<(PrefixSourceConfig Source, IReadOnlyList<(uint Prefix, byte Length)> Prefixes)>();
         foreach (var source in _config.PrefixSources)
         {
             IReadOnlyList<(uint Prefix, byte Length)> prefixes;
-            try { prefixes = await LoadCachedAsync(source); }
+            try { prefixes = await LoadCachedAsync(source, ct); }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to load prefix source '{Name}' ({Kind}).", source.Name, source.Kind);
@@ -99,20 +102,20 @@ public sealed class PrefixSourceService : IPrefixSourceService
         return result;
     }
 
-    public async Task WarmUpAsync()
+    public async Task WarmUpAsync(CancellationToken ct = default)
     {
-        foreach (var (source, prefixes) in await LoadAllAsync())
+        foreach (var (source, prefixes) in await LoadAllAsync(ct))
             Console.WriteLine($"  WarmUp: source '{source.Name}' — {prefixes.Count} prefixes");
     }
 
-    private async Task<IReadOnlyList<(uint Prefix, byte Length)>> LoadCachedAsync(PrefixSourceConfig source)
+    private async Task<IReadOnlyList<(uint Prefix, byte Length)>> LoadCachedAsync(PrefixSourceConfig source, CancellationToken ct)
     {
         if (TryGetFresh(source.Name, out var fresh))
             return fresh;
 
         // Serialize per-key so concurrent callers share a single fetch (no thundering herd).
         var gate = _locks.GetOrAdd(source.Name, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync();
+        await gate.WaitAsync(ct);
         try
         {
             if (TryGetFresh(source.Name, out var rechecked))
@@ -122,8 +125,9 @@ public sealed class PrefixSourceService : IPrefixSourceService
             try
             {
                 var provider = _factory.Get(source.Kind);
-                prefixes = await provider.LoadAsync(source);
+                prefixes = await provider.LoadAsync(source, ct);
             }
+            catch (OperationCanceledException) { throw; }
             catch
             {
                 // Serve the last good copy if we have one (regardless of its age).
