@@ -979,12 +979,17 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     #endregion
 
+    private bool _disposed;
+
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+
         _cts.Cancel();
         _cts.Dispose();
-        // Dispose the limiters currently in effect at shutdown (#136); limiters replaced mid-flight by
-        // ApplyConfig are already disposed there.
+        // At shutdown no requests are in-flight, so disposing the current limiters is safe
+        // (unlike ApplyConfig mid-flight where we leave old ones for GC per #137's CodeRabbit fix).
         Volatile.Read(ref _rateLimiter)?.Dispose();
         Volatile.Read(ref _concurrencyLimiter)?.Dispose();
         _listener?.Close();
