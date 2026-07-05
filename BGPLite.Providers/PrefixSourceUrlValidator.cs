@@ -31,6 +31,10 @@ public static class PrefixSourceUrlValidator
         IPNetwork.Parse("fe80::/10"),           // IPv6 link-local
     ];
 
+    /// <summary>Per-address connect budget so one blackholed candidate can't consume the whole
+    /// ConnectTimeout before the next resolved address is tried.</summary>
+    private static readonly TimeSpan PerAttemptConnectTimeout = TimeSpan.FromSeconds(5);
+
     /// <summary>True if the address falls in a blocked (non-public) range.</summary>
     internal static bool IsBlockedAddress(IPAddress address)
     {
@@ -42,7 +46,8 @@ public static class PrefixSourceUrlValidator
 
     /// <summary>
     /// SocketsHttpHandler.ConnectCallback: resolves DNS, validates ALL resolved IPs are public,
-    /// then connects to the first valid one. No TOCTOU (the validated IP IS the connected IP).
+    /// then connects with a matching-family socket per address (IPv4 preferred) until one succeeds.
+    /// No TOCTOU — every address is validated above and the connected IP is one of them.
     /// SocketsHttpHandler does NOT follow redirects (no 302-to-internal-IP bypass).
     /// </summary>
     public static async ValueTask<Stream> CreateValidatedConnectionAsync(
@@ -61,6 +66,9 @@ public static class PrefixSourceUrlValidator
             throw new InvalidOperationException($"DNS resolution failed for '{host}': {ex.Message}", ex);
         }
 
+        if (addresses.Length == 0)
+            throw new InvalidOperationException($"DNS returned no addresses for '{host}'.");
+
         foreach (var addr in addresses)
         {
             if (IsBlockedAddress(addr))
@@ -68,18 +76,50 @@ public static class PrefixSourceUrlValidator
                     $"SSRF blocked: '{host}' resolves to non-public address {addr}.");
         }
 
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-        try
+        // Connect with a matching-family socket per address, IPv4-first, until one succeeds. A host
+        // whose first DNS record is IPv6 used to throw SocketException (AddressFamilyNotSupported)
+        // on the hardcoded IPv4 socket (#151); and many deployments (e.g. an IPv4-only server with no
+        // IPv6 on the interface) can only route IPv4 anyway. Now each validated address gets its own
+        // socket and we fall through to the next on failure.
+        Exception? last = null;
+        foreach (var addr in OrderForConnect(addresses))
         {
-            await socket.ConnectAsync(addresses[0], port, ct);
-            return new NetworkStream(socket, ownsSocket: true);
+            // Bound each attempt so one blackholed address can't consume the whole connect budget
+            // before the next candidate is tried. Real cancellation (ct) still propagates.
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            attempt.CancelAfter(PerAttemptConnectTimeout);
+
+            var socket = new Socket(addr.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            try
+            {
+                await socket.ConnectAsync(addr, port, attempt.Token);
+                return new NetworkStream(socket, ownsSocket: true);
+            }
+            catch (OperationCanceledException) when (attempt.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                socket.Dispose();
+                last = new TimeoutException(
+                    $"Timed out connecting to '{host}' ({addr}) after {PerAttemptConnectTimeout.TotalSeconds:0}s; trying next address.");
+            }
+            catch (OperationCanceledException) { socket.Dispose(); throw; }
+            catch (Exception ex)
+            {
+                socket.Dispose();
+                last = ex;
+            }
         }
-        catch
-        {
-            socket.Dispose();
-            throw;
-        }
+
+        throw new InvalidOperationException(
+            $"Could not connect to '{host}' on any of {addresses.Length} resolved address(es).", last);
     }
+
+    /// <summary>
+    /// Orders resolved addresses IPv4-first (stable within each family). IPv4 is preferred because
+    /// many deployments (e.g. an IPv4-only server with no IPv6 on the interface) can only route IPv4,
+    /// so an IPv6 address returned first by DNS would be unreachable. Internal for unit testing.
+    /// </summary>
+    internal static IEnumerable<IPAddress> OrderForConnect(IPAddress[] addresses)
+        => addresses.OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1);
 
     /// <summary>
     /// Validates that a URL is well-formed, uses http/https, and resolves to a public IP.
