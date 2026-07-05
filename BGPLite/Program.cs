@@ -81,6 +81,12 @@ builder.Services.AddHttpClient(HttpPrefixProvider.ClientName, c =>
 {
     c.Timeout = TimeSpan.FromSeconds(30);
     c.DefaultRequestHeaders.UserAgent.ParseAdd("BGPLite/1.0");
+})
+.ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+{
+    // SSRF defense (#144): validate DNS resolution at the socket level — no TOCTOU race, no
+    // redirect bypass (SocketsHttpHandler does not follow redirects, unlike HttpClientHandler).
+    ConnectCallback = PrefixSourceUrlValidator.CreateValidatedConnectionAsync
 });
 builder.Services.AddSingleton<HttpPrefixProvider>();
 builder.Services.AddSingleton<FilePrefixProvider>();
