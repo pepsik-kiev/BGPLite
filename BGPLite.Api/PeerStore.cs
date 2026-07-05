@@ -244,6 +244,54 @@ public sealed class PeerStore : IPeerStore
         db.SaveChanges();
     }
 
+    /// <summary>
+    /// Lists all user-supplied URL-based prefix-list sources for a peer (#143). Sources are stored as
+    /// URLs (not parsed); fetched at send time in SendAllRoutesAsync.
+    /// </summary>
+    public List<PeerCustomSource> GetCustomSources(string peerId)
+    {
+        using var db = _dbFactory.CreateDbContext();
+        return db.Set<PeerCustomSource>().AsNoTracking()
+            .Where(c => c.PeerId == peerId)
+            .ToList();
+    }
+
+    /// <summary>Adds a URL-based prefix-list source to a peer. Returns the created entity (with Id).</summary>
+    public PeerCustomSource AddCustomSource(string peerId, string name, string url, string? community)
+    {
+        using var db = _dbFactory.CreateDbContext();
+        var source = new PeerCustomSource
+        {
+            PeerId = peerId,
+            Name = name,
+            Url = url,
+            Community = community
+        };
+        db.Set<PeerCustomSource>().Add(source);
+        db.SaveChanges();
+        return source;
+    }
+
+    /// <summary>Removes a URL-based source by its Id, scoped to a peer. Returns true if found and removed.</summary>
+    public bool DeleteCustomSource(string peerId, string sourceId)
+    {
+        using var db = _dbFactory.CreateDbContext();
+        var deleted = db.Set<PeerCustomSource>()
+            .Where(c => c.Id == sourceId && c.PeerId == peerId)
+            .ExecuteDelete();
+        return deleted > 0;
+    }
+
+    /// <summary>Toggles a source's active state, scoped to a peer. Returns true if found and updated.</summary>
+    public bool SetSourceActive(string peerId, string sourceId, bool active)
+    {
+        using var db = _dbFactory.CreateDbContext();
+        var updated = db.Set<PeerCustomSource>()
+            .Where(c => c.Id == sourceId && c.PeerId == peerId)
+            .ExecuteUpdate(s => s.SetProperty(c => c.Active, active));
+        return updated > 0;
+    }
+
     private static PeerInfo MapToInfo(Peer peer) => new()
     {
         Id = peer.Id,
