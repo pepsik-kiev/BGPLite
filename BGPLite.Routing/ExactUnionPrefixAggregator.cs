@@ -19,20 +19,42 @@ public sealed class ExactUnionPrefixAggregator : IPrefixAggregator
 {
     public IReadOnlyList<Route> Aggregate(IEnumerable<Route> routes)
     {
+        // #82: avoid the defensive ToList when the caller already owns a List<Route>.
+        // The sole caller (RouteAssembler → SendRoutesAsync) passes a List<Route>, so the
+        // `as List<Route>` fast path fires and the ToList allocation is skipped entirely.
         var source = routes as List<Route> ?? routes.ToList();
         if (source.Count == 0)
             return source;
 
         var result = new List<Route>(source.Count);
 
+        // #82: manual single-pass partition instead of LINQ GroupBy. GroupBy allocates a
+        // Lookup + per-group Lists; a Dictionary<AttributeKey, List<Route>> partitions in one
+        // pass with the same semantics and less intermediate allocation. The groups preserve
+        // encounter order (Dictionary maintains insertion order in .NET), matching GroupBy's
+        // documented behavior for same-key elements.
+        // Capacity is the expected number of DISTINCT community sets, not route count.
+        // A typical send carries 1-5 community sets even with tens of thousands of routes.
+        var groups = new Dictionary<AttributeKey, List<Route>>(4);
+        foreach (var route in source)
+        {
+            var key = AttributeKey.From(route);
+            if (!groups.TryGetValue(key, out var group))
+            {
+                group = new List<Route>();
+                groups[key] = group;
+            }
+            group.Add(route);
+        }
+
         // Group by the attributes that survive to the wire. The outgoing path rewrites
         // AS_PATH (to the local ASN) and NEXT_HOP, so only Communities/LargeCommunities
         // distinguish otherwise-mergeable prefixes; prefixes carrying different communities
         // stay in separate groups so community information is never mixed during merging.
-        foreach (var group in source.GroupBy(AttributeKey.From))
+        foreach (var (key, group) in groups)
         {
-            var template = group.First();
-            foreach (var (prefix, length) in AggregatePrefixes(group.Select(r => (r.Prefix, r.PrefixLength))))
+            var template = group[0];
+            foreach (var (prefix, length) in AggregatePrefixes(group))
             {
                 result.Add(new Route
                 {
@@ -48,13 +70,15 @@ public sealed class ExactUnionPrefixAggregator : IPrefixAggregator
         return result;
     }
 
-    /// <summary>Exact-union CIDR merge of raw (prefix, length) pairs.</summary>
-    private static List<(uint Prefix, byte Length)> AggregatePrefixes(IEnumerable<(uint Prefix, byte Length)> prefixes)
+    /// <summary>Exact-union CIDR merge of the prefixes carried by a group of routes.</summary>
+    private static List<(uint Prefix, byte Length)> AggregatePrefixes(IReadOnlyList<Route> routes)
     {
         // 1. Mask host bits and build inclusive [start, end] intervals. ulong so a /0 fits.
-        var intervals = new List<(ulong Start, ulong End)>();
-        foreach (var (prefix, length) in prefixes)
+        var intervals = new List<(ulong Start, ulong End)>(routes.Count);
+        for (var i = 0; i < routes.Count; i++)
         {
+            var prefix = routes[i].Prefix;
+            var length = routes[i].PrefixLength;
             if (length > 32) continue; // defensive: skip malformed prefixes
             var mask = length == 0 ? 0u : (0xFFFFFFFFu << (32 - length));
             var start = (ulong)(prefix & mask);
