@@ -49,6 +49,16 @@ public sealed class AppConfig
     public ApiRateLimitConfig? ApiRateLimit { get; init; }
 
     /// <summary>
+    /// Maximum request body size in bytes accepted by the management API on POST/PUT/PATCH routes
+    /// (#156). Bodies larger than this are rejected with <c>413 Payload Too Large</c> before
+    /// deserialization, defending against memory-exhaustion DoS (<c>HttpListener</c> has no default
+    /// body cap). 1 MiB comfortably fits any realistic peer-config payload (hundreds of CIDRs /
+    /// ASNs); raise it only if an operator legitimately needs larger writes. Defaults to 1 MiB.
+    /// </summary>
+    [YamlMember(Alias = "MaxRequestBodyBytes")]
+    public long MaxRequestBodyBytes { get; init; } = 1024 * 1024;
+
+    /// <summary>
     /// Origins allowed to make cross-origin (CORS) requests to the management API (#99), e.g.
     /// <c>["https://operator.example.com", "https://bgp.example.net"]</c>. A request's
     /// <c>Origin</c> header is echoed back as <c>Access-Control-Allow-Origin</c> only when it
@@ -75,6 +85,15 @@ public sealed class AppConfig
         if (ApiPort < 1 || ApiPort > 65535)
             throw new InvalidOperationException(
                 $"Invalid configuration: ApiPort must be between 1 and 65535 (got {ApiPort}).");
+
+        // MaxRequestBodyBytes is a security boundary (#156 DoS cap); reject nonsensical values at
+        // startup so a bad YAML cannot break all mutating API requests (<= 0) or weaken the cap to
+        // nothing (impractically large). 1 KiB lower bound leaves room for a minimal peer payload;
+        // 64 MiB upper bound is far beyond any legitimate peer-config write.
+        if (MaxRequestBodyBytes is < 1024 or > 64 * 1024 * 1024)
+            throw new InvalidOperationException(
+                $"Invalid configuration: MaxRequestBodyBytes must be between 1024 and 67108864 bytes " +
+                $"(got {MaxRequestBodyBytes}).");
 
         for (var i = 0; i < Peers.Count; i++)
         {
