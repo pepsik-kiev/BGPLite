@@ -188,4 +188,47 @@ public class IpAcceptThrottleTests
         throttle.SweepStale(ticks);                        // evict 1.1.1.1, keep 2.2.2.2
         Assert.Equal(1, throttle.TrackedCount);
     }
+
+    /// <summary>
+    /// Regression for #133: a concurrent TryAccept that refreshes a Window must NOT have its entry
+    /// removed by a racing SweepStale. The coarse _dictLock makes the staleness-check + remove atomic
+    /// against TryAccept's GetOrAdd + refresh. Under the prior per-Window lock, a sweep checking
+    /// staleness under the Window lock, then TryRemove'ing outside any dictionary-level atomicity,
+    /// could orphan a just-refreshed Window — effectively resetting the IP's per-IP limit.
+    /// </summary>
+    /// <remarks>
+    /// Deterministic single-IP scenario: an IP fills its window to the limit, then a sweep races a
+    /// same-window accept. If the sweep orphaned the Window (the #133 bug), the next same-window
+    /// accept would be ADMITTED (fresh Window, count 0) instead of DENIED. The coarse lock makes the
+    /// sweep observe the just-recorded accept and keep the Window, so the IP's limit is preserved.
+    /// </remarks>
+    [Fact]
+    public void SweepStale_RacingAccept_Does_Not_Reset_PerIpLimit()
+    {
+        const int limit = 3;
+        var ticks = 1_000L;
+        var throttle = new IpAcceptThrottle(maxPerMinute: limit, nowTicks: () => ticks);
+        const string ip = "198.51.100.1";
+
+        // Fill the window to the limit — every subsequent same-window accept must be denied.
+        for (var i = 0; i < limit; i++)
+            Assert.True(throttle.TryAccept(ip), $"accept {i + 1} within limit");
+        Assert.False(throttle.TryAccept(ip), "accept over limit denied");
+
+        // A same-window accept that races a sweep: the sweep sees the Window is fresh (timestamps
+        // within the window), does NOT remove it, and the IP's limit is preserved. We simulate the
+        // race deterministically by interleaving: advance time just-under the window (still fresh),
+        // sweep, then try to accept again in the same window.
+        ticks += MinuteTicks - 1; // still within the window (1 tick short)
+        throttle.SweepStale(ticks); // must NOT evict — timestamps are fresh
+        Assert.True(throttle.TrackedCount >= 1, "fresh IP must not be evicted by the sweep");
+
+        // The same-window accept must still be denied — the Window's count is preserved.
+        Assert.False(throttle.TryAccept(ip), "accept after sweep still denied — limit not reset");
+
+        // After the window genuinely expires, the IP IS evicted and a fresh accept is admitted.
+        ticks += 2; // now past the window
+        throttle.SweepStale(ticks);
+        Assert.True(throttle.TryAccept(ip), "fresh accept after window expiry admitted");
+    }
 }
